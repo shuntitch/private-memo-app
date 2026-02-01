@@ -732,65 +732,79 @@ export default function App() {
             </TouchableOpacity>
           </View>
 
-          <ScrollView style={styles.content} contentContainerStyle={{ paddingBottom: 40 }}>
-            <TextInput style={styles.titleInput} placeholder="제목" value={title} onChangeText={setTitle} />
+          <View style={styles.content}>
+            {/* 상단 메타 정보 영역 */}
+            <View style={styles.metaSection}>
+              <TextInput
+                style={styles.titleInput}
+                placeholder="제목"
+                value={title}
+                onChangeText={setTitle}
+                placeholderTextColor="#9CA3AF"
+              />
 
-            <View style={styles.section}>
-              <View style={styles.rowBetween}>
-                <Text style={styles.label}>카테고리 (복수 선택 가능):</Text>
+              <View style={styles.metaRow}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.metaLabel}>카테고리</Text>
+                  <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginTop: 8 }}>
+                    {categories
+                      .filter((cat) => cat.id !== DELETED_CATEGORY_ID)
+                      .map((cat) => {
+                        const isSelected = memoCategories.includes(cat.id);
+                        return (
+                          <TouchableOpacity
+                            key={cat.id}
+                            onPress={() => {
+                              if (isSelected) {
+                                setMemoCategories(memoCategories.filter((id) => id !== cat.id));
+                              } else {
+                                setMemoCategories([...memoCategories, cat.id]);
+                              }
+                            }}
+                            style={[
+                              styles.categoryChipCompact,
+                              { backgroundColor: cat.color.light },
+                              isSelected && styles.selectedChipCompact,
+                            ]}
+                          >
+                            <Text style={[styles.chipTextCompact, isSelected && styles.selectedChipTextCompact]}>
+                              {isSelected ? '✓ ' : ''}{cat.name}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                  </ScrollView>
+                </View>
+
                 <TouchableOpacity
                   onPress={() => setMemoPinned((p) => !p)}
-                  style={[styles.pinToggle, memoPinned && styles.pinToggleActive]}
+                  style={[styles.pinToggleCompact, memoPinned && styles.pinToggleActiveCompact]}
                 >
-                  <Text style={[styles.pinToggleText, memoPinned && styles.pinToggleTextActive]}>
-                    {memoPinned ? '📌 고정됨' : '📌 고정'}
+                  <Text style={[styles.pinToggleTextCompact, memoPinned && styles.pinToggleTextActiveCompact]}>
+                    {memoPinned ? '📌' : '📌'}
                   </Text>
                 </TouchableOpacity>
               </View>
 
-              <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-                {categories
-                  .filter((cat) => cat.id !== DELETED_CATEGORY_ID)
-                  .map((cat) => {
-                    const isSelected = memoCategories.includes(cat.id);
-                    return (
-                      <TouchableOpacity
-                        key={cat.id}
-                        onPress={() => {
-                          if (isSelected) {
-                            setMemoCategories(memoCategories.filter((id) => id !== cat.id));
-                          } else {
-                            setMemoCategories([...memoCategories, cat.id]);
-                          }
-                        }}
-                        style={[
-                          styles.categoryChip,
-                          { backgroundColor: cat.color.light },
-                          isSelected && styles.selectedChip,
-                        ]}
-                      >
-                        <Text style={[styles.chipText, isSelected && styles.selectedChipText]}>
-                          {isSelected ? '✓ ' : ''}{cat.name}
-                        </Text>
-                      </TouchableOpacity>
-                    );
-                  })}
-              </ScrollView>
+              {/* 구분선 */}
+              <View style={styles.divider} />
             </View>
 
+            {/* 메모 입력 영역 - 나머지 공간 모두 사용 */}
             <TextInput
               style={styles.contentInput}
-              placeholder="메모를 입력하세요..."
+              placeholder="여기에 메모를 작성하세요..."
               value={content}
               onChangeText={setContent}
               multiline
-              textAlignVertical="top"
+              placeholderTextColor="#9CA3AF"
             />
 
-            {/* 이미지 섹션 */}
-            <View style={styles.section}>
-              <Text style={styles.label}>이미지:</Text>
-              <TouchableOpacity
+            {/* 하단 이미지 섹션 */}
+            <View style={styles.imageSection}>
+              <View style={styles.imageSectionHeader}>
+                <Text style={styles.imageSectionLabel}>📎 첨부 이미지</Text>
+                <TouchableOpacity
                 onPress={async () => {
                   try {
                     if (Platform.OS === 'web' && typeof document !== 'undefined') {
@@ -875,10 +889,11 @@ export default function App() {
                     Alert.alert('오류', '이미지 업로드 중 오류가 발생했습니다.');
                   }
                 }}
-                style={styles.imageButton}
+                style={styles.imageButtonCompact}
               >
-                <Text style={styles.imageButtonText}>+ 이미지 추가</Text>
+                <Text style={styles.imageButtonTextCompact}>+ 추가</Text>
               </TouchableOpacity>
+              </View>
 
               {memoImages.length > 0 && (
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.imageList}>
@@ -904,7 +919,7 @@ export default function App() {
                 </ScrollView>
               )}
             </View>
-          </ScrollView>
+          </View>
 
           {/* 이미지 뷰어 모달 */}
           <Modal visible={showImageModal} transparent animationType="fade">
@@ -1333,8 +1348,7 @@ const styles = StyleSheet.create({
   // 공통 컨텐츠 영역
   content: {
     flex: 1,
-    padding: 16,
-    paddingTop: 16,
+    backgroundColor: '#FFFFFF',
   },
 
   // 메모 카드
@@ -1484,8 +1498,104 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#1F2937',
     lineHeight: 24,
-    minHeight: 400,
+    flex: 1,
+    minHeight: 300,
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    textAlignVertical: 'top',
+  },
+  metaSection: {
+    backgroundColor: '#F9FAFB',
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E5E7EB',
+  },
+  metaRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 12,
+    marginTop: 12,
+  },
+  metaLabel: {
+    fontSize: 12,
+    color: '#6B7280',
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  divider: {
+    height: 1,
+    backgroundColor: '#E5E7EB',
+    marginTop: 16,
+  },
+  categoryChipCompact: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    marginRight: 8,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  selectedChipCompact: {
+    borderWidth: 1.5,
+    borderColor: '#3B82F6',
+  },
+  chipTextCompact: {
+    fontSize: 13,
+    color: '#1F2937',
+    fontWeight: '600',
+  },
+  selectedChipTextCompact: {
+    color: '#3B82F6',
+    fontWeight: '700',
+  },
+  pinToggleCompact: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#F3F4F6',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginLeft: 8,
+  },
+  pinToggleActiveCompact: {
+    backgroundColor: '#DBEAFE',
+  },
+  pinToggleTextCompact: {
+    fontSize: 20,
+  },
+  pinToggleTextActiveCompact: {
+    fontSize: 20,
+  },
+  imageSection: {
+    backgroundColor: '#F9FAFB',
+    paddingHorizontal: 16,
     paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#E5E7EB',
+  },
+  imageSectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  imageSectionLabel: {
+    fontSize: 14,
+    color: '#6B7280',
+    fontWeight: '600',
+  },
+  imageButtonCompact: {
+    backgroundColor: '#3B82F6',
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  imageButtonTextCompact: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
   },
 
   // 카테고리 화면
