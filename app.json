@@ -1,0 +1,36 @@
+{
+  "expo": {
+    "name": "메모 앱",
+    "slug": "memo_test",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.yourname.memotest"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.yourname.memotest",
+      "edgeToEdgeEnabled": true
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "name": "메모 앱",
+      "shortName": "메모",
+      "description": "간편한 메모 관리 앱",
+      "themeColor": "#3B82F6",
+      "backgroundColor": "#F9FAFB"
+    }
+  }
+}
