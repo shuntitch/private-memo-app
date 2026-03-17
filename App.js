@@ -12,9 +12,10 @@ import {
   Platform,
   Image,
   KeyboardAvoidingView,
+  ActivityIndicator,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ImagePicker from 'expo-image-picker';
+import { supabase } from './supabaseClient';
 
 // 사용 가능한 색상들
 const COLORS = [
@@ -53,6 +54,35 @@ const ensureDeletedCategory = (cats) => {
   return exists ? cats : [...cats, buildDeletedCategory()];
 };
 
+// 웹 이미지 압축 헬퍼
+const compressImageWeb = (file, maxSize, quality) => {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = document.createElement('img');
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        if (width > height && width > maxSize) {
+          height = (height * maxSize) / width;
+          width = maxSize;
+        } else if (height > maxSize) {
+          width = (width * maxSize) / height;
+          height = maxSize;
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        canvas.toBlob(resolve, 'image/jpeg', quality);
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+};
+
 // 정렬 모드
 const SORT_MODES = [
   { id: 'latest', label: '최신' },
@@ -61,22 +91,33 @@ const SORT_MODES = [
 ];
 
 export default function App() {
+  // ─── 인증 상태 ───
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [authMode, setAuthMode] = useState('login'); // 'login' | 'signup' | 'reset'
+  const [resetSent, setResetSent] = useState(false);
+
+  // ─── 데이터 상태 ───
   const [categories, setCategories] = useState([]);
   const [memos, setMemos] = useState([]);
-  const [currentView, setCurrentView] = useState('list'); // 'list', 'edit', 'categoryEdit'
+  const [dataLoading, setDataLoading] = useState(false);
+  const [currentView, setCurrentView] = useState('list');
   const [currentMemo, setCurrentMemo] = useState(null);
-  const [selectedCategories, setSelectedCategories] = useState([]); // 복수 선택으로 변경
+  const [selectedCategories, setSelectedCategories] = useState([]);
 
   // 리스트 부가 기능 상태
   const [searchQuery, setSearchQuery] = useState('');
-  const [sortMode, setSortMode] = useState('latest'); // latest | oldest | title
+  const [sortMode, setSortMode] = useState('latest');
 
   // 메모 입력 상태
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
-  const [memoCategories, setMemoCategories] = useState([]); // 복수 선택으로 변경
+  const [memoCategories, setMemoCategories] = useState([]);
   const [memoPinned, setMemoPinned] = useState(false);
-  const [memoImages, setMemoImages] = useState([]); // 이미지 배열 추가
+  const [memoImages, setMemoImages] = useState([]);
 
   // 카테고리 입력 상태
   const [categoryName, setCategoryName] = useState('');
@@ -89,87 +130,158 @@ export default function App() {
   const [selectedImage, setSelectedImage] = useState(null);
   const [selectedImageIndex, setSelectedImageIndex] = useState(0);
 
+  // ─── 인증 Effect ───
   useEffect(() => {
-    loadData();
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setAuthLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
+  // 로그인 후 데이터 로드 + 마이그레이션 체크
+  useEffect(() => {
+    if (session) {
+      loadData().then(() => {
+        if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
+          const localMemos = localStorage.getItem('memos');
+          const localCategories = localStorage.getItem('categories');
+          if (localMemos || localCategories) {
+            migrateLocalData();
+          }
+        }
+      });
+    }
+  }, [session]);
+
+  // ─── 인증 함수 ───
+  const handleLogin = async () => {
+    setAuthError('');
+    const { error } = await supabase.auth.signInWithPassword({
+      email: authEmail.trim(),
+      password: authPassword,
+    });
+    if (error) {
+      if (error.message.includes('Invalid login credentials')) {
+        setAuthError('이메일 또는 비밀번호가 올바르지 않습니다.');
+      } else {
+        setAuthError(error.message);
+      }
+    }
+  };
+
+  const handleSignUp = async () => {
+    setAuthError('');
+    if (!authEmail.trim()) {
+      setAuthError('이메일을 입력하세요.');
+      return;
+    }
+    if (authPassword.length < 6) {
+      setAuthError('비밀번호는 6자 이상이어야 합니다.');
+      return;
+    }
+    const { error } = await supabase.auth.signUp({
+      email: authEmail.trim(),
+      password: authPassword,
+    });
+    if (error) {
+      if (error.message.includes('already registered')) {
+        setAuthError('이미 등록된 이메일입니다.');
+      } else {
+        setAuthError(error.message);
+      }
+    }
+  };
+
+  const handleResetPassword = async () => {
+    setAuthError('');
+    if (!authEmail.trim()) {
+      setAuthError('이메일을 입력하세요.');
+      return;
+    }
+    const { error } = await supabase.auth.resetPasswordForEmail(authEmail.trim(), {
+      redirectTo: 'https://cerulean-pie-99509e.netlify.app',
+    });
+    if (error) {
+      setAuthError(error.message);
+    } else {
+      setResetSent(true);
+    }
+  };
+
+  const handleLogout = async () => {
+    const message = '로그아웃 하시겠습니까?';
+    if (Platform.OS === 'web') {
+      if (!window.confirm(message)) return;
+    } else {
+      const confirmed = await new Promise((resolve) => {
+        Alert.alert('로그아웃', message, [
+          { text: '취소', style: 'cancel', onPress: () => resolve(false) },
+          { text: '확인', onPress: () => resolve(true) },
+        ]);
+      });
+      if (!confirmed) return;
+    }
+    await supabase.auth.signOut();
+    setCategories([]);
+    setMemos([]);
+    setSession(null);
+  };
+
+  // ─── 데이터 로드 (Supabase) ───
   const loadData = async () => {
     try {
-      let savedCategories, savedMemos;
+      setDataLoading(true);
 
-      // 웹 환경에서는 localStorage 직접 사용
-      if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
-        savedCategories = localStorage.getItem('categories');
-        savedMemos = localStorage.getItem('memos');
-        console.log('localStorage에서 로드:', {
-          categories: savedCategories ? '있음' : '없음',
-          memos: savedMemos ? '있음' : '없음',
-          categoriesSize: savedCategories ? (savedCategories.length / 1024).toFixed(2) + 'KB' : '0KB',
-          memosSize: savedMemos ? (savedMemos.length / 1024).toFixed(2) + 'KB' : '0KB'
-        });
-      } else {
-        savedCategories = await AsyncStorage.getItem('categories');
-        savedMemos = await AsyncStorage.getItem('memos');
-      }
+      const { data: dbCategories, error: catError } = await supabase
+        .from('categories')
+        .select('*')
+        .order('created_at', { ascending: true });
+      if (catError) throw catError;
 
-      let parsedCategories = savedCategories ? JSON.parse(savedCategories) : [];
-      let parsedMemos = savedMemos ? JSON.parse(savedMemos) : [];
+      let parsedCategories = (dbCategories || []).map((row) => ({
+        id: row.id,
+        name: row.name,
+        color: row.color,
+        createdAt: row.created_at,
+      }));
 
-      // 카테고리가 하나도 없으면 기본 카테고리 생성
+      // 카테고리가 없으면 기본 생성
       if (parsedCategories.length === 0) {
-        parsedCategories = [
-          {
-            id: Date.now().toString(),
-            name: '일반',
-            color: COLORS[0],
-            createdAt: new Date().toISOString(),
-          },
-          {
-            id: (Date.now() + 1).toString(),
-            name: '중요',
-            color: COLORS[1],
-            createdAt: new Date().toISOString(),
-          },
-          {
-            id: (Date.now() + 2).toString(),
-            name: '할일',
-            color: COLORS[2],
-            createdAt: new Date().toISOString(),
-          },
+        const now = Date.now();
+        const defaults = [
+          { id: now.toString(), user_id: session.user.id, name: '일반', color: COLORS[0], created_at: new Date().toISOString() },
+          { id: (now + 1).toString(), user_id: session.user.id, name: '중요', color: COLORS[1], created_at: new Date().toISOString() },
+          { id: (now + 2).toString(), user_id: session.user.id, name: '할일', color: COLORS[2], created_at: new Date().toISOString() },
         ];
-        console.log('기본 카테고리 생성됨');
+        const { error: insertError } = await supabase.from('categories').insert(defaults);
+        if (insertError) throw insertError;
+        parsedCategories = defaults.map((d) => ({ id: d.id, name: d.name, color: d.color, createdAt: d.created_at }));
       }
 
-      console.log('파싱된 데이터:', {
-        categoriesCount: parsedCategories.length,
-        memosCount: parsedMemos.length
-      });
+      const { data: dbMemos, error: memoError } = await supabase
+        .from('memos')
+        .select('*')
+        .order('updated_at', { ascending: false });
+      if (memoError) throw memoError;
 
-      // 데이터 마이그레이션: 단일 카테고리 → 복수 카테고리
-      parsedMemos = parsedMemos.map((m) => {
-        let migrated = { ...m };
+      let parsedMemos = (dbMemos || []).map((row) => ({
+        id: row.id,
+        title: row.title,
+        content: row.content,
+        categoryIds: row.category_ids || [],
+        pinned: row.pinned || false,
+        images: row.images || [],
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }));
 
-        // pinned 보정
-        migrated.pinned = typeof m.pinned === 'boolean' ? m.pinned : false;
-
-        // categoryId → categoryIds 변환
-        if (m.categoryId !== undefined && !m.categoryIds) {
-          migrated.categoryIds = m.categoryId ? [m.categoryId] : [];
-          delete migrated.categoryId;
-        } else if (!m.categoryIds) {
-          migrated.categoryIds = [];
-        }
-
-        // images 보정
-        migrated.images = Array.isArray(m.images) ? m.images : [];
-
-        return migrated;
-      });
-
-      // memos 중 삭제된 카테고리를 참조하는 것이 있으면, categories에 "삭제된 카테고리"를 보장
-      const hasDeletedRef = parsedMemos.some((m) =>
-        m.categoryIds && m.categoryIds.includes(DELETED_CATEGORY_ID)
-      );
+      const hasDeletedRef = parsedMemos.some((m) => m.categoryIds && m.categoryIds.includes(DELETED_CATEGORY_ID));
       if (hasDeletedRef) {
         parsedCategories = ensureDeletedCategory(parsedCategories);
       }
@@ -178,89 +290,168 @@ export default function App() {
       setMemos(parsedMemos);
     } catch (error) {
       console.error('데이터 로드 실패:', error);
+      const msg = '데이터를 불러오는데 실패했습니다.';
+      if (Platform.OS === 'web') {
+        window.alert(msg);
+      } else {
+        Alert.alert('오류', msg);
+      }
+    } finally {
+      setDataLoading(false);
     }
   };
 
+  // ─── localStorage → Supabase 마이그레이션 ───
+  const migrateLocalData = async () => {
+    if (Platform.OS !== 'web' || typeof localStorage === 'undefined') return;
+
+    const localMemos = localStorage.getItem('memos');
+    const localCategories = localStorage.getItem('categories');
+    if (!localMemos && !localCategories) return;
+
+    const confirmed = window.confirm(
+      '기존 로컬 데이터를 발견했습니다.\n서버로 가져오시겠습니까?\n\n(가져오기를 하면 기기 변경/캐시 삭제 후에도 메모가 유지됩니다)'
+    );
+    if (!confirmed) {
+      localStorage.removeItem('memos');
+      localStorage.removeItem('categories');
+      return;
+    }
+
+    try {
+      if (localCategories) {
+        const cats = JSON.parse(localCategories);
+        const rows = cats.map((c) => ({
+          id: c.id,
+          user_id: session.user.id,
+          name: c.name,
+          color: c.color,
+          created_at: c.createdAt || new Date().toISOString(),
+        }));
+        if (rows.length > 0) {
+          const { error } = await supabase.from('categories').upsert(rows, { onConflict: 'id' });
+          if (error) throw error;
+        }
+      }
+
+      if (localMemos) {
+        const memosArr = JSON.parse(localMemos);
+        for (const memo of memosArr) {
+          const newImages = [];
+          const images = memo.images || [];
+          for (let i = 0; i < images.length; i++) {
+            const img = images[i];
+            if (img.startsWith('data:')) {
+              try {
+                const response = await fetch(img);
+                const blob = await response.blob();
+                const fileName = `${session.user.id}/${memo.id}/migrated-${i}.jpg`;
+                const { error: uploadError } = await supabase.storage
+                  .from('memo-images')
+                  .upload(fileName, blob, { contentType: 'image/jpeg', upsert: true });
+                if (uploadError) {
+                  console.error('이미지 마이그레이션 실패:', uploadError);
+                  continue;
+                }
+                const { data: { publicUrl } } = supabase.storage
+                  .from('memo-images')
+                  .getPublicUrl(fileName);
+                newImages.push(publicUrl);
+              } catch (e) {
+                console.error('이미지 변환 실패:', e);
+              }
+            } else {
+              newImages.push(img);
+            }
+          }
+
+          const categoryIds = memo.categoryIds || (memo.categoryId ? [memo.categoryId] : []);
+          const row = {
+            id: memo.id,
+            user_id: session.user.id,
+            title: memo.title || '제목 없음',
+            content: memo.content || '',
+            category_ids: categoryIds,
+            pinned: memo.pinned || false,
+            images: newImages,
+            created_at: memo.createdAt || new Date().toISOString(),
+            updated_at: memo.updatedAt || new Date().toISOString(),
+          };
+          const { error } = await supabase.from('memos').upsert(row, { onConflict: 'id' });
+          if (error) throw error;
+        }
+      }
+
+      localStorage.removeItem('memos');
+      localStorage.removeItem('categories');
+      await loadData();
+      window.alert('데이터 마이그레이션이 완료되었습니다!');
+    } catch (error) {
+      console.error('마이그레이션 실패:', error);
+      window.alert('데이터 마이그레이션 중 오류가 발생했습니다: ' + error.message);
+    }
+  };
+
+  // ─── 카테고리 저장 (Supabase) ───
   const saveCategories = async (newCategories) => {
     try {
       setCategories(newCategories);
-      const jsonData = JSON.stringify(newCategories);
-
-      // 웹 환경에서는 localStorage 직접 사용
-      if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
-        try {
-          localStorage.setItem('categories', jsonData);
-          console.log('카테고리 저장 성공:', newCategories.length);
-        } catch (e) {
-          console.error('localStorage 저장 실패:', e);
-          Alert.alert('저장 실패', 'localStorage 용량 초과 또는 오류');
-        }
-      } else {
-        await AsyncStorage.setItem('categories', jsonData);
-      }
+      const rows = newCategories.map((c) => ({
+        id: c.id,
+        user_id: session.user.id,
+        name: c.name,
+        color: c.color,
+        created_at: c.createdAt || new Date().toISOString(),
+      }));
+      const { error } = await supabase.from('categories').upsert(rows, { onConflict: 'id' });
+      if (error) throw error;
     } catch (error) {
       console.error('카테고리 저장 실패:', error);
-      Alert.alert('오류', '카테고리 저장 중 오류 발생');
+      const msg = '카테고리 저장 중 오류 발생';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('오류', msg);
     }
   };
 
+  // ─── 메모 저장 (Supabase) ───
   const saveMemos = async (newMemos) => {
     try {
       setMemos(newMemos);
-      const jsonData = JSON.stringify(newMemos);
-      const sizeInMB = (new Blob([jsonData]).size / (1024 * 1024)).toFixed(2);
-      console.log('메모 저장 시도:', { count: newMemos.length, size: sizeInMB + 'MB' });
-
-      // 웹 환경에서는 localStorage 직접 사용
-      if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
-        try {
-          localStorage.setItem('memos', jsonData);
-          console.log('메모 localStorage 저장 완료');
-
-          // 저장 확인
-          const verified = localStorage.getItem('memos');
-          if (verified === jsonData) {
-            console.log('✓ 저장 검증 성공');
-          } else {
-            console.error('✗ 저장 검증 실패: 데이터 불일치');
-          }
-        } catch (e) {
-          console.error('localStorage 저장 실패:', e.name, e.message);
-          if (e.name === 'QuotaExceededError') {
-            Alert.alert(
-              '저장 용량 초과',
-              `브라우저 저장 공간이 부족합니다.\n\n현재 크기: ${sizeInMB}MB\n\n해결 방법:\n1. 이미지 개수를 줄이세요\n2. 일부 메모를 삭제하세요\n3. 브라우저 캐시를 지우세요`,
-              [{ text: '확인' }]
-            );
-          } else {
-            Alert.alert('저장 실패', `오류: ${e.message}`);
-          }
-          return false;
-        }
-      } else {
-        await AsyncStorage.setItem('memos', jsonData);
-      }
+      const rows = newMemos.map((m) => ({
+        id: m.id,
+        user_id: session.user.id,
+        title: m.title,
+        content: m.content,
+        category_ids: m.categoryIds,
+        pinned: m.pinned,
+        images: m.images,
+        created_at: m.createdAt,
+        updated_at: m.updatedAt,
+      }));
+      const { error } = await supabase.from('memos').upsert(rows, { onConflict: 'id' });
+      if (error) throw error;
       return true;
     } catch (error) {
       console.error('메모 저장 실패:', error);
-      Alert.alert('오류', '메모 저장 중 오류 발생');
+      const msg = '메모 저장 중 오류 발생';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('오류', msg);
       return false;
     }
   };
 
-  // 카테고리 관리
-  const createOrUpdateCategory = () => {
+  // ─── 카테고리 관리 ───
+  const createOrUpdateCategory = async () => {
     if (!categoryName.trim()) {
       Alert.alert('알림', '카테고리 이름을 입력하세요.');
       return;
     }
 
     if (editingCategory) {
-      // 카테고리 업데이트 (메모의 색상 동기화는 제거 - 복수 카테고리로 인해 복잡도 증가)
       const updatedCategories = categories.map((c) =>
         c.id === editingCategory.id ? { ...c, name: categoryName, color: categoryColor } : c
       );
-      saveCategories(updatedCategories);
+      await saveCategories(updatedCategories);
     } else {
       const newCategory = {
         id: Date.now().toString(),
@@ -268,7 +459,7 @@ export default function App() {
         color: categoryColor,
         createdAt: new Date().toISOString(),
       };
-      saveCategories([...categories, newCategory]);
+      await saveCategories([...categories, newCategory]);
     }
 
     setCategoryName('');
@@ -277,8 +468,7 @@ export default function App() {
     setShowCategoryModal(false);
   };
 
-  const deleteCategory = (id) => {
-    // 삭제된 카테고리는 삭제 불가(안전장치)
+  const deleteCategory = async (id) => {
     if (id === DELETED_CATEGORY_ID) {
       if (Platform.OS === 'web') {
         window.alert("'삭제된 카테고리'는 삭제할 수 없습니다.");
@@ -290,128 +480,82 @@ export default function App() {
 
     const target = categories.find((c) => c.id === id);
     if (!target) return;
-
-    const affectedCount = memos.filter((m) => m.categoryIds && m.categoryIds.includes(id)).length;
+    const affectedMemos = memos.filter((m) => m.categoryIds && m.categoryIds.includes(id));
+    const affectedCount = affectedMemos.length;
 
     const message =
       affectedCount > 0
         ? `해당 카테고리로 등록된 메모가 ${affectedCount}개 존재합니다.\n그래도 삭제하시겠습니까?\n삭제 시 해당 카테고리는 '삭제된 카테고리'로 대체됩니다.`
         : '이 카테고리를 삭제하시겠습니까?';
 
-    // 웹 환경
+    let confirmed;
     if (Platform.OS === 'web') {
-      const confirmed = window.confirm(message);
-      if (!confirmed) return;
-
-      console.log('카테고리 삭제 시작:', id);
-
-      setCategories((currentCategories) => {
-        console.log('현재 카테고리 개수:', currentCategories.length);
-        let nextCategories = currentCategories.filter((c) => c.id !== id);
-        if (affectedCount > 0) {
-          nextCategories = ensureDeletedCategory(nextCategories);
-        }
-        console.log('삭제 후 카테고리 개수:', nextCategories.length);
-
-        try {
-          const jsonData = JSON.stringify(nextCategories);
-          localStorage.setItem('categories', jsonData);
-          console.log('카테고리 삭제 저장 완료');
-        } catch (error) {
-          console.error('카테고리 삭제 저장 실패:', error);
-        }
-
-        return nextCategories;
+      confirmed = window.confirm(message);
+    } else {
+      confirmed = await new Promise((resolve) => {
+        Alert.alert('카테고리 삭제', message, [
+          { text: '취소', style: 'cancel', onPress: () => resolve(false) },
+          { text: '삭제', style: 'destructive', onPress: () => resolve(true) },
+        ]);
       });
+    }
+    if (!confirmed) return;
 
+    try {
+      // Supabase에서 카테고리 삭제
+      const { error: delError } = await supabase.from('categories').delete().eq('id', id);
+      if (delError) throw delError;
+
+      // 영향받는 메모 업데이트
       if (affectedCount > 0) {
-        setMemos((currentMemos) => {
-          const nextMemos = currentMemos.map((m) => {
-            if (m.categoryIds && m.categoryIds.includes(id)) {
-              const newCategoryIds = m.categoryIds.filter((cid) => cid !== id);
-              if (!newCategoryIds.includes(DELETED_CATEGORY_ID)) {
-                newCategoryIds.push(DELETED_CATEGORY_ID);
-              }
-              return { ...m, categoryIds: newCategoryIds };
-            }
-            return m;
-          });
+        const deletedCat = buildDeletedCategory();
+        await supabase.from('categories').upsert({
+          id: deletedCat.id,
+          user_id: session.user.id,
+          name: deletedCat.name,
+          color: deletedCat.color,
+          created_at: deletedCat.createdAt,
+        }, { onConflict: 'id' });
 
-          try {
-            const jsonData = JSON.stringify(nextMemos);
-            localStorage.setItem('memos', jsonData);
-            console.log('메모 업데이트 저장 완료');
-          } catch (error) {
-            console.error('메모 업데이트 저장 실패:', error);
+        for (const memo of affectedMemos) {
+          const newCategoryIds = memo.categoryIds.filter((cid) => cid !== id);
+          if (!newCategoryIds.includes(DELETED_CATEGORY_ID)) {
+            newCategoryIds.push(DELETED_CATEGORY_ID);
           }
-
-          return nextMemos;
-        });
+          await supabase.from('memos').update({ category_ids: newCategoryIds }).eq('id', memo.id);
+        }
       }
 
-      setSelectedCategories((prev) => prev.filter((cid) => cid !== id));
-    } else {
-      // 네이티브 환경
-      Alert.alert('카테고리 삭제', message, [
-        { text: '취소', style: 'cancel' },
-        {
-          text: '삭제',
-          style: 'destructive',
-          onPress: () => {
-            console.log('카테고리 삭제 시작:', id);
+      // 로컬 상태 업데이트
+      let nextCategories = categories.filter((c) => c.id !== id);
+      if (affectedCount > 0) {
+        nextCategories = ensureDeletedCategory(nextCategories);
+      }
+      setCategories(nextCategories);
 
-            setCategories((currentCategories) => {
-              console.log('현재 카테고리 개수:', currentCategories.length);
-              let nextCategories = currentCategories.filter((c) => c.id !== id);
-              if (affectedCount > 0) {
-                nextCategories = ensureDeletedCategory(nextCategories);
-              }
-              console.log('삭제 후 카테고리 개수:', nextCategories.length);
-
-              try {
-                const jsonData = JSON.stringify(nextCategories);
-                AsyncStorage.setItem('categories', jsonData);
-                console.log('카테고리 삭제 저장 완료');
-              } catch (error) {
-                console.error('카테고리 삭제 저장 실패:', error);
-              }
-
-              return nextCategories;
-            });
-
-            if (affectedCount > 0) {
-              setMemos((currentMemos) => {
-                const nextMemos = currentMemos.map((m) => {
-                  if (m.categoryIds && m.categoryIds.includes(id)) {
-                    const newCategoryIds = m.categoryIds.filter((cid) => cid !== id);
-                    if (!newCategoryIds.includes(DELETED_CATEGORY_ID)) {
-                      newCategoryIds.push(DELETED_CATEGORY_ID);
-                    }
-                    return { ...m, categoryIds: newCategoryIds };
-                  }
-                  return m;
-                });
-
-                try {
-                  const jsonData = JSON.stringify(nextMemos);
-                  AsyncStorage.setItem('memos', jsonData);
-                  console.log('메모 업데이트 저장 완료');
-                } catch (error) {
-                  console.error('메모 업데이트 저장 실패:', error);
-                }
-
-                return nextMemos;
-              });
+      setMemos((prev) =>
+        prev.map((m) => {
+          if (m.categoryIds && m.categoryIds.includes(id)) {
+            const newCategoryIds = m.categoryIds.filter((cid) => cid !== id);
+            if (!newCategoryIds.includes(DELETED_CATEGORY_ID)) {
+              newCategoryIds.push(DELETED_CATEGORY_ID);
             }
+            return { ...m, categoryIds: newCategoryIds };
+          }
+          return m;
+        })
+      );
 
-            setSelectedCategories((prev) => prev.filter((cid) => cid !== id));
-          },
-        },
-      ]);
+      setSelectedCategories((prev) => prev.filter((cid) => cid !== id));
+    } catch (error) {
+      console.error('카테고리 삭제 실패:', error);
+      const msg = '카테고리 삭제 중 오류 발생';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('오류', msg);
     }
   };
 
-  // 메모 관리
+  // ─── 메모 관리 ───
   const createNewMemo = () => {
     setCurrentMemo(null);
     setTitle('');
@@ -470,84 +614,156 @@ export default function App() {
       success = await saveMemos([newMemo, ...memos]);
     }
 
-    // 저장 성공 시에만 화면 전환
     if (success) {
       setCurrentView('list');
     }
   };
 
-  const deleteMemo = (id) => {
-    // 웹 환경에서는 window.confirm 사용
+  const deleteMemo = async (id) => {
+    const message = '이 메모를 삭제하시겠습니까?';
+
+    let confirmed;
     if (Platform.OS === 'web') {
-      const confirmed = window.confirm('이 메모를 삭제하시겠습니까?');
-      if (!confirmed) return;
-
-      console.log('메모 삭제 시작:', id);
-      setMemos((currentMemos) => {
-        console.log('현재 메모 개수:', currentMemos.length);
-        const updated = currentMemos.filter((m) => m.id !== id);
-        console.log('삭제 후 메모 개수:', updated.length);
-
-        try {
-          const jsonData = JSON.stringify(updated);
-          localStorage.setItem('memos', jsonData);
-          console.log('메모 삭제 저장 완료');
-        } catch (error) {
-          console.error('메모 삭제 저장 실패:', error);
-          window.alert('메모 삭제 중 오류가 발생했습니다.');
-        }
-
-        return updated;
-      });
+      confirmed = window.confirm(message);
     } else {
-      // 네이티브 환경
-      Alert.alert('메모 삭제', '이 메모를 삭제하시겠습니까?', [
-        { text: '취소', style: 'cancel' },
-        {
-          text: '삭제',
-          style: 'destructive',
-          onPress: () => {
-            console.log('메모 삭제 시작:', id);
-            setMemos((currentMemos) => {
-              console.log('현재 메모 개수:', currentMemos.length);
-              const updated = currentMemos.filter((m) => m.id !== id);
-              console.log('삭제 후 메모 개수:', updated.length);
+      confirmed = await new Promise((resolve) => {
+        Alert.alert('메모 삭제', message, [
+          { text: '취소', style: 'cancel', onPress: () => resolve(false) },
+          { text: '삭제', style: 'destructive', onPress: () => resolve(true) },
+        ]);
+      });
+    }
+    if (!confirmed) return;
 
-              try {
-                const jsonData = JSON.stringify(updated);
-                AsyncStorage.setItem('memos', jsonData);
-                console.log('메모 삭제 저장 완료');
-              } catch (error) {
-                console.error('메모 삭제 저장 실패:', error);
-                Alert.alert('오류', '메모 삭제 중 오류 발생');
-              }
+    try {
+      // 연관 이미지 삭제
+      const memo = memos.find((m) => m.id === id);
+      if (memo && memo.images && memo.images.length > 0) {
+        const paths = memo.images
+          .map((url) => {
+            const match = url.match(/memo-images\/(.+)$/);
+            return match ? match[1] : null;
+          })
+          .filter(Boolean);
+        if (paths.length > 0) {
+          await supabase.storage.from('memo-images').remove(paths);
+        }
+      }
 
-              return updated;
-            });
-          },
-        },
-      ]);
+      const { error } = await supabase.from('memos').delete().eq('id', id);
+      if (error) throw error;
+      setMemos((prev) => prev.filter((m) => m.id !== id));
+    } catch (error) {
+      console.error('메모 삭제 실패:', error);
+      const msg = '메모 삭제 중 오류 발생';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('오류', msg);
     }
   };
 
   const togglePinMemo = async (id) => {
-    const updated = memos.map((m) =>
-      m.id === id ? { ...m, pinned: !m.pinned } : m
-    );
-    await saveMemos(updated);
+    const memo = memos.find((m) => m.id === id);
+    if (!memo) return;
+    const newPinned = !memo.pinned;
+
+    const { error } = await supabase.from('memos').update({ pinned: newPinned }).eq('id', id);
+    if (error) {
+      console.error('핀 토글 실패:', error);
+      return;
+    }
+    setMemos((prev) => prev.map((m) => (m.id === id ? { ...m, pinned: newPinned } : m)));
   };
 
-  // 리스트에 표시할 메모: 카테고리 필터 → 검색 → 정렬(핀 우선)
+  // ─── 이미지 업로드 (Supabase Storage) ───
+  const pickAndUploadImages = async () => {
+    try {
+      if (Platform.OS === 'web' && typeof document !== 'undefined') {
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'image/*';
+        input.multiple = true;
+        input.onchange = async (e) => {
+          const files = Array.from(e.target.files);
+          for (const file of files) {
+            if (file.size > 5 * 1024 * 1024) {
+              window.alert('이미지는 5MB 이하만 가능합니다.');
+              continue;
+            }
+            try {
+              const compressedBlob = await compressImageWeb(file, 600, 0.5);
+              const memoId = currentMemo ? currentMemo.id : 'temp-' + Date.now();
+              const fileName = `${session.user.id}/${memoId}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
+              const { error: uploadError } = await supabase.storage
+                .from('memo-images')
+                .upload(fileName, compressedBlob, { contentType: 'image/jpeg' });
+              if (uploadError) {
+                console.error('이미지 업로드 오류:', uploadError);
+                continue;
+              }
+              const { data: { publicUrl } } = supabase.storage
+                .from('memo-images')
+                .getPublicUrl(fileName);
+              setMemoImages((prev) => [...prev, publicUrl]);
+            } catch (err) {
+              console.error('이미지 처리 오류:', err);
+            }
+          }
+        };
+        input.click();
+      } else {
+        const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (status !== 'granted') {
+          Alert.alert('권한 필요', '갤러리 접근 권한이 필요합니다.');
+          return;
+        }
+
+        const result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ImagePicker.MediaTypeOptions.Images,
+          allowsMultipleSelection: true,
+          quality: 0.5,
+          allowsEditing: false,
+          maxWidth: 600,
+          maxHeight: 600,
+        });
+
+        if (!result.canceled) {
+          for (const asset of result.assets) {
+            try {
+              const memoId = currentMemo ? currentMemo.id : 'temp-' + Date.now();
+              const fileName = `${session.user.id}/${memoId}/${Date.now()}.jpg`;
+              const response = await fetch(asset.uri);
+              const blob = await response.blob();
+              const { error: uploadError } = await supabase.storage
+                .from('memo-images')
+                .upload(fileName, blob, { contentType: 'image/jpeg' });
+              if (uploadError) {
+                console.error('이미지 업로드 오류:', uploadError);
+                continue;
+              }
+              const { data: { publicUrl } } = supabase.storage
+                .from('memo-images')
+                .getPublicUrl(fileName);
+              setMemoImages((prev) => [...prev, publicUrl]);
+            } catch (err) {
+              console.error('이미지 처리 오류:', err);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error('이미지 업로드 오류:', error);
+      Alert.alert('오류', '이미지 업로드 중 오류가 발생했습니다.');
+    }
+  };
+
+  // ─── 정렬/필터 ───
   const displayedMemos = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
 
-    // OR 조건: 선택한 카테고리 중 하나라도 포함된 메모
-    let arr = selectedCategories.length > 0
-      ? memos.filter((m) =>
-          m.categoryIds &&
-          m.categoryIds.some((cid) => selectedCategories.includes(cid))
-        )
-      : [...memos];
+    let arr =
+      selectedCategories.length > 0
+        ? memos.filter((m) => m.categoryIds && m.categoryIds.some((cid) => selectedCategories.includes(cid)))
+        : [...memos];
 
     if (q) {
       arr = arr.filter((m) => {
@@ -558,22 +774,15 @@ export default function App() {
     }
 
     const compare = (a, b) => {
-      if (sortMode === 'oldest') {
-        return new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime();
-      }
-      if (sortMode === 'title') {
-        return (a.title || '').localeCompare(b.title || '', 'ko');
-      }
-      // latest (default)
+      if (sortMode === 'oldest') return new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime();
+      if (sortMode === 'title') return (a.title || '').localeCompare(b.title || '', 'ko');
       return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
     };
 
     const pinned = arr.filter((m) => m.pinned);
     const normal = arr.filter((m) => !m.pinned);
-
     pinned.sort(compare);
     normal.sort(compare);
-
     return [...pinned, ...normal];
   }, [memos, selectedCategories, searchQuery, sortMode]);
 
@@ -597,9 +806,135 @@ export default function App() {
     });
   };
 
-  // 카테고리 편집 화면
+  // ═══════════════════════════════════════════
+  // 렌더링
+  // ═══════════════════════════════════════════
+
+  // 로딩 화면
+  if (authLoading) {
+    return (
+      <View style={styles.centerScreen}>
+        <StatusBar barStyle="dark-content" />
+        <ActivityIndicator size="large" color="#3B82F6" />
+        <Text style={{ marginTop: 12, color: '#6B7280', fontSize: 16 }}>로딩 중...</Text>
+      </View>
+    );
+  }
+
+  // ─── 인증 화면 ───
+  if (!session) {
+    return (
+      <View style={styles.centerScreen}>
+        <StatusBar barStyle="dark-content" />
+        <Text style={styles.authTitle}>📝 메모 앱</Text>
+
+        {authMode === 'reset' ? (
+          // 비밀번호 재설정 화면
+          <>
+            <Text style={styles.authSubtitle}>비밀번호 재설정</Text>
+            {resetSent ? (
+              <>
+                <View style={styles.authSuccessBox}>
+                  <Text style={styles.authSuccessText}>
+                    비밀번호 재설정 링크가 이메일로 발송되었습니다.{'\n'}이메일을 확인해주세요.
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  onPress={() => { setAuthMode('login'); setResetSent(false); setAuthError(''); }}
+                  style={[styles.authButton, { backgroundColor: '#6B7280' }]}
+                >
+                  <Text style={styles.authButtonText}>로그인으로 돌아가기</Text>
+                </TouchableOpacity>
+              </>
+            ) : (
+              <>
+                <Text style={styles.authHint}>가입한 이메일을 입력하면 비밀번호 재설정 링크를 보내드립니다.</Text>
+                <TextInput
+                  style={styles.authInput}
+                  placeholder="이메일"
+                  value={authEmail}
+                  onChangeText={setAuthEmail}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                />
+                {authError ? <Text style={styles.authErrorText}>{authError}</Text> : null}
+                <TouchableOpacity onPress={handleResetPassword} style={styles.authButton}>
+                  <Text style={styles.authButtonText}>재설정 링크 보내기</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => { setAuthMode('login'); setAuthError(''); }}>
+                  <Text style={styles.authLinkText}>← 로그인으로 돌아가기</Text>
+                </TouchableOpacity>
+              </>
+            )}
+          </>
+        ) : (
+          // 로그인 / 회원가입 화면
+          <>
+            <Text style={styles.authSubtitle}>
+              {authMode === 'signup' ? '새 계정 만들기' : '로그인'}
+            </Text>
+
+            <TextInput
+              style={styles.authInput}
+              placeholder="이메일"
+              value={authEmail}
+              onChangeText={setAuthEmail}
+              keyboardType="email-address"
+              autoCapitalize="none"
+            />
+            <TextInput
+              style={styles.authInput}
+              placeholder="비밀번호"
+              value={authPassword}
+              onChangeText={setAuthPassword}
+              secureTextEntry
+            />
+
+            {authError ? <Text style={styles.authErrorText}>{authError}</Text> : null}
+
+            <TouchableOpacity
+              onPress={authMode === 'signup' ? handleSignUp : handleLogin}
+              style={styles.authButton}
+            >
+              <Text style={styles.authButtonText}>
+                {authMode === 'signup' ? '회원가입' : '로그인'}
+              </Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={() => { setAuthMode(authMode === 'signup' ? 'login' : 'signup'); setAuthError(''); }}
+            >
+              <Text style={styles.authLinkText}>
+                {authMode === 'signup' ? '이미 계정이 있으신가요? 로그인' : '계정이 없으신가요? 회원가입'}
+              </Text>
+            </TouchableOpacity>
+
+            {authMode === 'login' && (
+              <TouchableOpacity onPress={() => { setAuthMode('reset'); setAuthError(''); setResetSent(false); }}>
+                <Text style={[styles.authLinkText, { color: '#6B7280', marginTop: 8 }]}>
+                  비밀번호를 잊으셨나요?
+                </Text>
+              </TouchableOpacity>
+            )}
+          </>
+        )}
+      </View>
+    );
+  }
+
+  // 데이터 로딩 화면
+  if (dataLoading) {
+    return (
+      <View style={styles.centerScreen}>
+        <StatusBar barStyle="dark-content" />
+        <ActivityIndicator size="large" color="#3B82F6" />
+        <Text style={{ marginTop: 12, color: '#6B7280', fontSize: 16 }}>데이터 불러오는 중...</Text>
+      </View>
+    );
+  }
+
+  // ─── 카테고리 편집 화면 ───
   if (currentView === 'categoryEdit') {
-    // 삭제된 카테고리는 목록에서 제외
     const visibleCategories = categories.filter((cat) => cat.id !== DELETED_CATEGORY_ID);
 
     return (
@@ -624,37 +959,35 @@ export default function App() {
           </View>
 
           <ScrollView style={styles.content}>
-            {visibleCategories.map((cat) => {
-              return (
-                <View key={cat.id} style={[styles.categoryItem, { backgroundColor: cat.color.light }]}>
-                  <View style={styles.categoryInfo}>
-                    <View style={[styles.colorDot, { backgroundColor: cat.color.color }]} />
-                    <Text style={styles.categoryName}>{cat.name}</Text>
-                  </View>
-
-                  <View style={styles.categoryActions}>
-                    <TouchableOpacity
-                      onPress={() => {
-                        setCategoryName(cat.name);
-                        setCategoryColor(cat.color);
-                        setEditingCategory(cat);
-                        setShowCategoryModal(true);
-                      }}
-                      style={styles.actionButton}
-                    >
-                      <Text style={styles.actionButtonText}>수정</Text>
-                    </TouchableOpacity>
-
-                    <TouchableOpacity
-                      onPress={() => deleteCategory(cat.id)}
-                      style={[styles.actionButton, styles.deleteButton]}
-                    >
-                      <Text style={styles.deleteButtonText}>삭제</Text>
-                    </TouchableOpacity>
-                  </View>
+            {visibleCategories.map((cat) => (
+              <View key={cat.id} style={[styles.categoryItem, { backgroundColor: cat.color.light }]}>
+                <View style={styles.categoryInfo}>
+                  <View style={[styles.colorDot, { backgroundColor: cat.color.color }]} />
+                  <Text style={styles.categoryName}>{cat.name}</Text>
                 </View>
-              );
-            })}
+
+                <View style={styles.categoryActions}>
+                  <TouchableOpacity
+                    onPress={() => {
+                      setCategoryName(cat.name);
+                      setCategoryColor(cat.color);
+                      setEditingCategory(cat);
+                      setShowCategoryModal(true);
+                    }}
+                    style={styles.actionButton}
+                  >
+                    <Text style={styles.actionButtonText}>수정</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    onPress={() => deleteCategory(cat.id)}
+                    style={[styles.actionButton, styles.deleteButton]}
+                  >
+                    <Text style={styles.deleteButtonText}>삭제</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ))}
 
             {visibleCategories.length === 0 && (
               <Text style={styles.emptyText}>
@@ -663,7 +996,6 @@ export default function App() {
             )}
           </ScrollView>
 
-          {/* 카테고리 추가/수정 모달 */}
           <Modal visible={showCategoryModal} transparent animationType="slide">
             <View style={styles.modalOverlay}>
               <View style={styles.modalContent}>
@@ -713,7 +1045,7 @@ export default function App() {
     );
   }
 
-  // 메모 작성/수정 화면
+  // ─── 메모 작성/수정 화면 ───
   if (currentView === 'edit') {
     return (
       <View style={{ flex: 1, backgroundColor: '#FFFFFF', paddingTop: Platform.OS === 'ios' ? 44 : 0 }}>
@@ -733,7 +1065,6 @@ export default function App() {
           </View>
 
           <View style={styles.content}>
-            {/* 상단 메타 정보 영역 */}
             <View style={styles.metaSection}>
               <TextInput
                 style={styles.titleInput}
@@ -756,7 +1087,7 @@ export default function App() {
                             key={cat.id}
                             onPress={() => {
                               if (isSelected) {
-                                setMemoCategories(memoCategories.filter((id) => id !== cat.id));
+                                setMemoCategories(memoCategories.filter((cid) => cid !== cat.id));
                               } else {
                                 setMemoCategories([...memoCategories, cat.id]);
                               }
@@ -786,11 +1117,9 @@ export default function App() {
                 </TouchableOpacity>
               </View>
 
-              {/* 구분선 */}
               <View style={styles.divider} />
             </View>
 
-            {/* 메모 입력 영역 - 나머지 공간 모두 사용 */}
             <TextInput
               style={styles.contentInput}
               placeholder="여기에 메모를 작성하세요..."
@@ -800,99 +1129,12 @@ export default function App() {
               placeholderTextColor="#9CA3AF"
             />
 
-            {/* 하단 이미지 섹션 */}
             <View style={styles.imageSection}>
               <View style={styles.imageSectionHeader}>
                 <Text style={styles.imageSectionLabel}>📎 첨부 이미지</Text>
-                <TouchableOpacity
-                onPress={async () => {
-                  try {
-                    if (Platform.OS === 'web' && typeof document !== 'undefined') {
-                      // 웹 환경 - 이미지 압축 적용
-                      const input = document.createElement('input');
-                      input.type = 'file';
-                      input.accept = 'image/*';
-                      input.multiple = true;
-                      input.onchange = (e) => {
-                        const files = Array.from(e.target.files);
-                        files.forEach((file) => {
-                          if (file.size > 5 * 1024 * 1024) {
-                            Alert.alert('알림', '이미지는 5MB 이하만 가능합니다.');
-                            return;
-                          }
-
-                          // 이미지 압축
-                          const reader = new FileReader();
-                          reader.onload = (event) => {
-                            const img = document.createElement('img');
-                            img.onload = () => {
-                              // Canvas로 이미지 리사이즈 및 압축
-                              const canvas = document.createElement('canvas');
-                              let width = img.width;
-                              let height = img.height;
-
-                              // 최대 크기 제한 (600px로 줄임)
-                              const maxSize = 600;
-                              if (width > height && width > maxSize) {
-                                height = (height * maxSize) / width;
-                                width = maxSize;
-                              } else if (height > maxSize) {
-                                width = (width * maxSize) / height;
-                                height = maxSize;
-                              }
-
-                              canvas.width = width;
-                              canvas.height = height;
-                              const ctx = canvas.getContext('2d');
-                              ctx.drawImage(img, 0, 0, width, height);
-
-                              // JPEG 품질 0.5로 더 강력한 압축
-                              const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.5);
-                              const sizeMB = (compressedDataUrl.length * 0.75 / (1024 * 1024)).toFixed(2);
-                              console.log('압축된 이미지 크기:', sizeMB, 'MB');
-
-                              setMemoImages((prev) => [...prev, compressedDataUrl]);
-                            };
-                            img.src = event.target.result;
-                          };
-                          reader.readAsDataURL(file);
-                        });
-                      };
-                      input.click();
-                    } else {
-                      // 네이티브 환경 (iOS/Android)
-                      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-                      if (status !== 'granted') {
-                        Alert.alert('권한 필요', '갤러리 접근 권한이 필요합니다.');
-                        return;
-                      }
-
-                      const result = await ImagePicker.launchImageLibraryAsync({
-                        mediaTypes: ImagePicker.MediaTypeOptions.Images,
-                        allowsMultipleSelection: true,
-                        quality: 0.5,
-                        base64: true,
-                        allowsEditing: false,
-                        maxWidth: 600, // 최대 너비 제한 (800 → 600)
-                        maxHeight: 600, // 최대 높이 제한 (800 → 600)
-                      });
-
-                      if (!result.canceled) {
-                        result.assets.forEach((asset) => {
-                          const base64Image = `data:image/jpeg;base64,${asset.base64}`;
-                          setMemoImages((prev) => [...prev, base64Image]);
-                        });
-                      }
-                    }
-                  } catch (error) {
-                    console.error('이미지 업로드 오류:', error);
-                    Alert.alert('오류', '이미지 업로드 중 오류가 발생했습니다.');
-                  }
-                }}
-                style={styles.imageButtonCompact}
-              >
-                <Text style={styles.imageButtonTextCompact}>+ 추가</Text>
-              </TouchableOpacity>
+                <TouchableOpacity onPress={pickAndUploadImages} style={styles.imageButtonCompact}>
+                  <Text style={styles.imageButtonTextCompact}>+ 추가</Text>
+                </TouchableOpacity>
               </View>
 
               {memoImages.length > 0 && (
@@ -921,13 +1163,9 @@ export default function App() {
             </View>
           </View>
 
-          {/* 이미지 뷰어 모달 */}
           <Modal visible={showImageModal} transparent animationType="fade">
             <View style={styles.imageModalOverlay}>
-              <TouchableOpacity
-                style={styles.imageModalCloseButton}
-                onPress={() => setShowImageModal(false)}
-              >
+              <TouchableOpacity style={styles.imageModalCloseButton} onPress={() => setShowImageModal(false)}>
                 <Text style={styles.imageModalCloseText}>✕</Text>
               </TouchableOpacity>
 
@@ -938,15 +1176,11 @@ export default function App() {
                     style={styles.imageModalImage}
                     resizeMode="contain"
                   />
-
-                  {/* 이미지 카운터 */}
                   <View style={styles.imageModalCounter}>
                     <Text style={styles.imageModalCounterText}>
                       {selectedImageIndex + 1} / {selectedImage.length}
                     </Text>
                   </View>
-
-                  {/* 이전/다음 버튼 */}
                   {selectedImage.length > 1 && (
                     <>
                       {selectedImageIndex > 0 && (
@@ -957,7 +1191,6 @@ export default function App() {
                           <Text style={styles.imageModalNavText}>‹</Text>
                         </TouchableOpacity>
                       )}
-
                       {selectedImageIndex < selectedImage.length - 1 && (
                         <TouchableOpacity
                           style={[styles.imageModalNavButton, styles.imageModalNextButton]}
@@ -977,7 +1210,7 @@ export default function App() {
     );
   }
 
-  // 메모 목록 화면
+  // ─── 메모 목록 화면 ───
   return (
     <View style={{ flex: 1, backgroundColor: '#F9FAFB', paddingTop: Platform.OS === 'ios' ? 44 : 0 }}>
       <View style={{ flex: 1, backgroundColor: '#F9FAFB' }}>
@@ -992,10 +1225,12 @@ export default function App() {
             <TouchableOpacity onPress={createNewMemo} style={styles.iconButton}>
               <Text style={styles.iconButtonText}>✏️</Text>
             </TouchableOpacity>
+            <TouchableOpacity onPress={handleLogout} style={styles.iconButton}>
+              <Text style={styles.iconButtonText}>🚪</Text>
+            </TouchableOpacity>
           </View>
         </View>
 
-        {/* 검색 */}
         <View style={styles.searchBar}>
           <TextInput
             style={styles.searchInput}
@@ -1011,7 +1246,6 @@ export default function App() {
           )}
         </View>
 
-        {/* 정렬 */}
         <View style={styles.sortBar}>
           {SORT_MODES.map((m) => (
             <TouchableOpacity
@@ -1026,7 +1260,6 @@ export default function App() {
           ))}
         </View>
 
-        {/* 카테고리 필터 (복수 선택) */}
         {categories.filter((cat) => cat.id !== DELETED_CATEGORY_ID).length > 0 && (
           <View style={styles.filterBar}>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ alignItems: 'center' }}>
@@ -1048,7 +1281,7 @@ export default function App() {
                       key={cat.id}
                       onPress={() => {
                         if (isSelected) {
-                          setSelectedCategories(selectedCategories.filter((id) => id !== cat.id));
+                          setSelectedCategories(selectedCategories.filter((cid) => cid !== cat.id));
                         } else {
                           setSelectedCategories([...selectedCategories, cat.id]);
                         }
@@ -1078,13 +1311,10 @@ export default function App() {
             </Text>
           ) : (
             displayedMemos.map((memo) => {
-              // 메모의 카테고리들 가져오기
-              const memoCategories = (memo.categoryIds || [])
+              const memoCats = (memo.categoryIds || [])
                 .map((cid) => categories.find((c) => c.id === cid))
                 .filter(Boolean);
-
-              // 메모의 첫 번째 카테고리 색상 사용 (없으면 흰색)
-              const firstCategory = memoCategories[0];
+              const firstCategory = memoCats[0];
               const cardBgColor = firstCategory ? firstCategory.color.light : '#FFFFFF';
 
               return (
@@ -1117,7 +1347,6 @@ export default function App() {
                     </Text>
                   )}
 
-                  {/* 이미지 미리보기 */}
                   {memo.images && memo.images.length > 0 && (
                     <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.memoImageList}>
                       {memo.images.slice(0, 3).map((img, idx) => (
@@ -1149,7 +1378,7 @@ export default function App() {
 
                   <View style={styles.memoFooter}>
                     <View style={styles.memoCategoryList}>
-                      {memoCategories.map((cat) => (
+                      {memoCats.map((cat) => (
                         <View key={cat.id} style={[styles.memoCategoryTag, { backgroundColor: cat.color.color }]}>
                           <Text style={styles.memoCategoryText}>{cat.name}</Text>
                         </View>
@@ -1163,13 +1392,9 @@ export default function App() {
           )}
         </ScrollView>
 
-        {/* 이미지 뷰어 모달 */}
         <Modal visible={showImageModal} transparent animationType="fade">
           <View style={styles.imageModalOverlay}>
-            <TouchableOpacity
-              style={styles.imageModalCloseButton}
-              onPress={() => setShowImageModal(false)}
-            >
+            <TouchableOpacity style={styles.imageModalCloseButton} onPress={() => setShowImageModal(false)}>
               <Text style={styles.imageModalCloseText}>✕</Text>
             </TouchableOpacity>
 
@@ -1180,15 +1405,11 @@ export default function App() {
                   style={styles.imageModalImage}
                   resizeMode="contain"
                 />
-
-                {/* 이미지 카운터 */}
                 <View style={styles.imageModalCounter}>
                   <Text style={styles.imageModalCounterText}>
                     {selectedImageIndex + 1} / {selectedImage.length}
                   </Text>
                 </View>
-
-                {/* 이전/다음 버튼 */}
                 {selectedImage.length > 1 && (
                   <>
                     {selectedImageIndex > 0 && (
@@ -1199,7 +1420,6 @@ export default function App() {
                         <Text style={styles.imageModalNavText}>‹</Text>
                       </TouchableOpacity>
                     )}
-
                     {selectedImageIndex < selectedImage.length - 1 && (
                       <TouchableOpacity
                         style={[styles.imageModalNavButton, styles.imageModalNextButton]}
@@ -1220,6 +1440,88 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
+  // 센터 스크린 (로딩, 인증)
+  centerScreen: {
+    flex: 1,
+    backgroundColor: '#F9FAFB',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+
+  // 인증 화면
+  authTitle: {
+    fontSize: 32,
+    fontWeight: 'bold',
+    color: '#1F2937',
+    marginBottom: 8,
+  },
+  authSubtitle: {
+    fontSize: 16,
+    color: '#6B7280',
+    marginBottom: 32,
+  },
+  authHint: {
+    fontSize: 14,
+    color: '#6B7280',
+    marginBottom: 20,
+    textAlign: 'center',
+    lineHeight: 20,
+    width: '100%',
+    maxWidth: 360,
+  },
+  authInput: {
+    width: '100%',
+    maxWidth: 360,
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    borderRadius: 10,
+    padding: 14,
+    fontSize: 16,
+    marginBottom: 12,
+    backgroundColor: '#FFFFFF',
+  },
+  authErrorText: {
+    color: '#EF4444',
+    marginBottom: 12,
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  authButton: {
+    width: '100%',
+    maxWidth: 360,
+    backgroundColor: '#3B82F6',
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  authButtonText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  authLinkText: {
+    color: '#3B82F6',
+    fontSize: 14,
+    marginTop: 16,
+  },
+  authSuccessBox: {
+    backgroundColor: '#D1FAE5',
+    padding: 16,
+    borderRadius: 10,
+    marginBottom: 20,
+    width: '100%',
+    maxWidth: 360,
+  },
+  authSuccessText: {
+    color: '#065F46',
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
+  },
+
+  // 헤더
   header: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1473,7 +1775,6 @@ const styles = StyleSheet.create({
   pinToggleTextActive: {
     color: '#FFFFFF',
   },
-
   categoryChip: {
     paddingHorizontal: 10,
     paddingVertical: 2,
@@ -1716,8 +2017,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
   },
-
-  // 선택된 칩 텍스트
   selectedChipText: {
     fontWeight: '700',
   },
