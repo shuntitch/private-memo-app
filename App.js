@@ -83,6 +83,19 @@ const compressImageWeb = (file, maxSize, quality) => {
   });
 };
 
+// 서명 URL 유효기간(초)과 만료 전 갱신 주기(ms)
+const SIGNED_URL_TTL = 3600;
+const SIGNED_URL_REFRESH_MS = 45 * 60 * 1000;
+
+// 저장된 이미지 값을 스토리지 경로로 환산한다.
+// 구버전 데이터는 공개 URL 전체가, 신버전은 경로만 저장되어 있으므로 둘 다 받아준다.
+const toStoragePath = (value) => {
+  if (!value || typeof value !== 'string') return null;
+  if (!/^https?:\/\//i.test(value)) return value.replace(/^\/+/, '');
+  const match = value.match(/\/storage\/v1\/object\/(?:public|sign)\/memo-images\/([^?#]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
 // 인증 토큰이 남아있는 주소를 깨끗하게 정리 (새로고침 시 재진입 방지)
 const clearAuthUrl = () => {
   if (Platform.OS === 'web' && typeof window !== 'undefined' && window.history) {
@@ -138,6 +151,9 @@ export default function App() {
   const [categoryColor, setCategoryColor] = useState(COLORS[0]);
   const [editingCategory, setEditingCategory] = useState(null);
 
+  // 이미지 경로 → 서명 URL 캐시 (실패한 경로는 null로 기록해 재시도 루프를 막는다)
+  const [signedUrls, setSignedUrls] = useState({});
+
   // 모달 상태
   const [showCategoryModal, setShowCategoryModal] = useState(false);
   const [showImageModal, setShowImageModal] = useState(false);
@@ -188,6 +204,58 @@ export default function App() {
       });
     }
   }, [session, recoveryMode]);
+
+  // ─── 화면에 필요한 이미지의 서명 URL 발급 ───
+  useEffect(() => {
+    if (!session) return;
+
+    const needed = new Set();
+    const collect = (value) => {
+      const path = toStoragePath(value);
+      if (path) needed.add(path);
+    };
+    memos.forEach((m) => (m.images || []).forEach(collect));
+    memoImages.forEach(collect);
+
+    const missing = [...needed].filter(
+      (p) => !Object.prototype.hasOwnProperty.call(signedUrls, p)
+    );
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    supabase.storage
+      .from('memo-images')
+      .createSignedUrls(missing, SIGNED_URL_TTL)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error || !data) {
+          console.error('서명 URL 생성 실패:', error);
+          return;
+        }
+        setSignedUrls((prev) => {
+          const next = { ...prev };
+          // 요청한 경로를 먼저 전부 "시도함"으로 기록해야 무한 재시도에 빠지지 않는다
+          missing.forEach((p) => {
+            next[p] = null;
+          });
+          data.forEach((d) => {
+            if (d.path && d.signedUrl && !d.error) next[d.path] = d.signedUrl;
+          });
+          return next;
+        });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [session, memos, memoImages, signedUrls]);
+
+  // 서명 URL 만료 전에 캐시를 비워 재발급을 유도
+  useEffect(() => {
+    if (!session) return;
+    const timer = setInterval(() => setSignedUrls({}), SIGNED_URL_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, [session]);
 
   // ─── 인증 함수 ───
   const handleLogin = async () => {
@@ -422,10 +490,7 @@ export default function App() {
                   console.error('이미지 마이그레이션 실패:', uploadError);
                   continue;
                 }
-                const { data: { publicUrl } } = supabase.storage
-                  .from('memo-images')
-                  .getPublicUrl(fileName);
-                newImages.push(publicUrl);
+                newImages.push(fileName);
               } catch (e) {
                 console.error('이미지 변환 실패:', e);
               }
@@ -708,12 +773,7 @@ export default function App() {
       // 연관 이미지 삭제
       const memo = memos.find((m) => m.id === id);
       if (memo && memo.images && memo.images.length > 0) {
-        const paths = memo.images
-          .map((url) => {
-            const match = url.match(/memo-images\/(.+)$/);
-            return match ? match[1] : null;
-          })
-          .filter(Boolean);
+        const paths = memo.images.map(toStoragePath).filter(Boolean);
         if (paths.length > 0) {
           await supabase.storage.from('memo-images').remove(paths);
         }
@@ -769,10 +829,7 @@ export default function App() {
                 console.error('이미지 업로드 오류:', uploadError);
                 continue;
               }
-              const { data: { publicUrl } } = supabase.storage
-                .from('memo-images')
-                .getPublicUrl(fileName);
-              setMemoImages((prev) => [...prev, publicUrl]);
+              setMemoImages((prev) => [...prev, fileName]);
             } catch (err) {
               console.error('이미지 처리 오류:', err);
             }
@@ -809,10 +866,7 @@ export default function App() {
                 console.error('이미지 업로드 오류:', uploadError);
                 continue;
               }
-              const { data: { publicUrl } } = supabase.storage
-                .from('memo-images')
-                .getPublicUrl(fileName);
-              setMemoImages((prev) => [...prev, publicUrl]);
+              setMemoImages((prev) => [...prev, fileName]);
             } catch (err) {
               console.error('이미지 처리 오류:', err);
             }
@@ -854,6 +908,14 @@ export default function App() {
     normal.sort(compare);
     return [...pinned, ...normal];
   }, [memos, selectedCategories, searchQuery, sortMode]);
+
+  // 화면에 실제로 넣을 이미지 주소.
+  // 서명 URL이 준비되기 전에는 기존 공개 URL로 폴백한다(버킷 공개 상태에서만 유효).
+  const imageUri = (value) => {
+    const path = toStoragePath(value);
+    if (path && signedUrls[path]) return signedUrls[path];
+    return /^https?:\/\//i.test(value || '') ? value : undefined;
+  };
 
   const formatDate = (dateString) => {
     const date = new Date(dateString);
@@ -1292,7 +1354,7 @@ export default function App() {
                           setShowImageModal(true);
                         }}
                       >
-                        <Image source={{ uri: img }} style={styles.imagePreview} />
+                        <Image source={{ uri: imageUri(img) }} style={styles.imagePreview} />
                       </TouchableOpacity>
                       <TouchableOpacity
                         onPress={() => setMemoImages(memoImages.filter((_, i) => i !== idx))}
@@ -1316,7 +1378,7 @@ export default function App() {
               {selectedImage && selectedImage.length > 0 && (
                 <>
                   <Image
-                    source={{ uri: selectedImage[selectedImageIndex] }}
+                    source={{ uri: imageUri(selectedImage[selectedImageIndex]) }}
                     style={styles.imageModalImage}
                     resizeMode="contain"
                   />
@@ -1502,7 +1564,7 @@ export default function App() {
                             setShowImageModal(true);
                           }}
                         >
-                          <Image source={{ uri: img }} style={styles.memoImagePreview} />
+                          <Image source={{ uri: imageUri(img) }} style={styles.memoImagePreview} />
                         </TouchableOpacity>
                       ))}
                       {memo.images.length > 3 && (
@@ -1545,7 +1607,7 @@ export default function App() {
             {selectedImage && selectedImage.length > 0 && (
               <>
                 <Image
-                  source={{ uri: selectedImage[selectedImageIndex] }}
+                  source={{ uri: imageUri(selectedImage[selectedImageIndex]) }}
                   style={styles.imageModalImage}
                   resizeMode="contain"
                 />
