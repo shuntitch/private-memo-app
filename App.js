@@ -15,7 +15,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
-import { supabase } from './supabaseClient';
+import { supabase, initialAuthUrlParams } from './supabaseClient';
 
 // 사용 가능한 색상들
 const COLORS = [
@@ -83,6 +83,13 @@ const compressImageWeb = (file, maxSize, quality) => {
   });
 };
 
+// 인증 토큰이 남아있는 주소를 깨끗하게 정리 (새로고침 시 재진입 방지)
+const clearAuthUrl = () => {
+  if (Platform.OS === 'web' && typeof window !== 'undefined' && window.history) {
+    window.history.replaceState(null, '', window.location.pathname);
+  }
+};
+
 // 정렬 모드
 const SORT_MODES = [
   { id: 'latest', label: '최신' },
@@ -99,6 +106,13 @@ export default function App() {
   const [authError, setAuthError] = useState('');
   const [authMode, setAuthMode] = useState('login'); // 'login' | 'signup' | 'reset'
   const [resetSent, setResetSent] = useState(false);
+
+  // ─── 비밀번호 재설정(메일 링크 진입) 상태 ───
+  const [recoveryMode, setRecoveryMode] = useState(false);
+  const [newPassword, setNewPassword] = useState('');
+  const [newPasswordConfirm, setNewPasswordConfirm] = useState('');
+  const [passwordUpdating, setPasswordUpdating] = useState(false);
+  const [passwordUpdated, setPasswordUpdated] = useState(false);
 
   // ─── 데이터 상태 ───
   const [categories, setCategories] = useState([]);
@@ -132,12 +146,27 @@ export default function App() {
 
   // ─── 인증 Effect ───
   useEffect(() => {
+    // 재설정 메일 링크로 진입했는지 판별 (URL은 supabaseClient에서 미리 읽어둠)
+    const { isRecovery, errorCode, errorDescription } = initialAuthUrlParams;
+    if (errorCode) {
+      setAuthMode('reset');
+      setAuthError(
+        errorCode === 'otp_expired'
+          ? '재설정 링크가 만료되었습니다. 다시 요청해주세요.'
+          : errorDescription || '재설정 링크가 유효하지 않습니다.'
+      );
+      clearAuthUrl();
+    } else if (isRecovery) {
+      setRecoveryMode(true);
+    }
+
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
       setAuthLoading(false);
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY') setRecoveryMode(true);
       setSession(session);
     });
 
@@ -146,7 +175,8 @@ export default function App() {
 
   // 로그인 후 데이터 로드 + 마이그레이션 체크
   useEffect(() => {
-    if (session) {
+    // 재설정 중에는 데이터/마이그레이션 로드를 미룬다
+    if (session && !recoveryMode) {
       loadData().then(() => {
         if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
           const localMemos = localStorage.getItem('memos');
@@ -157,7 +187,7 @@ export default function App() {
         }
       });
     }
-  }, [session]);
+  }, [session, recoveryMode]);
 
   // ─── 인증 함수 ───
   const handleLogin = async () => {
@@ -212,6 +242,45 @@ export default function App() {
     } else {
       setResetSent(true);
     }
+  };
+
+  const handleUpdatePassword = async () => {
+    setAuthError('');
+    if (newPassword.length < 6) {
+      setAuthError('비밀번호는 6자 이상이어야 합니다.');
+      return;
+    }
+    if (newPassword !== newPasswordConfirm) {
+      setAuthError('비밀번호가 일치하지 않습니다.');
+      return;
+    }
+
+    setPasswordUpdating(true);
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    setPasswordUpdating(false);
+
+    if (error) {
+      if (error.message.includes('should be different')) {
+        setAuthError('기존과 다른 비밀번호를 입력해주세요.');
+      } else {
+        setAuthError(error.message);
+      }
+      return;
+    }
+
+    clearAuthUrl();
+    setNewPassword('');
+    setNewPasswordConfirm('');
+    setPasswordUpdated(true);
+  };
+
+  const exitRecoveryMode = () => {
+    clearAuthUrl();
+    setRecoveryMode(false);
+    setPasswordUpdated(false);
+    setNewPassword('');
+    setNewPasswordConfirm('');
+    setAuthError('');
   };
 
   const handleLogout = async () => {
@@ -817,6 +886,81 @@ export default function App() {
         <StatusBar barStyle="dark-content" />
         <ActivityIndicator size="large" color="#3B82F6" />
         <Text style={{ marginTop: 12, color: '#6B7280', fontSize: 16 }}>로딩 중...</Text>
+      </View>
+    );
+  }
+
+  // ─── 새 비밀번호 설정 화면 (재설정 메일 링크로 진입) ───
+  if (recoveryMode) {
+    return (
+      <View style={styles.centerScreen}>
+        <StatusBar barStyle="dark-content" />
+        <Text style={styles.authTitle}>📝 메모 앱</Text>
+        <Text style={styles.authSubtitle}>새 비밀번호 설정</Text>
+
+        {!session ? (
+          // 링크가 만료됐거나 이미 사용된 경우 (세션 교환 실패)
+          <>
+            <View style={styles.authWarnBox}>
+              <Text style={styles.authWarnText}>
+                재설정 링크가 만료되었거나 이미 사용되었습니다.{'\n'}재설정 메일을 다시 요청해주세요.
+              </Text>
+            </View>
+            <TouchableOpacity
+              onPress={() => {
+                exitRecoveryMode();
+                setAuthMode('reset');
+                setResetSent(false);
+              }}
+              style={styles.authButton}
+            >
+              <Text style={styles.authButtonText}>재설정 메일 다시 받기</Text>
+            </TouchableOpacity>
+          </>
+        ) : passwordUpdated ? (
+          <>
+            <View style={styles.authSuccessBox}>
+              <Text style={styles.authSuccessText}>
+                비밀번호가 변경되었습니다.{'\n'}다음 로그인부터 새 비밀번호를 사용해주세요.
+              </Text>
+            </View>
+            <TouchableOpacity onPress={exitRecoveryMode} style={styles.authButton}>
+              <Text style={styles.authButtonText}>메모 앱으로 이동</Text>
+            </TouchableOpacity>
+          </>
+        ) : (
+          <>
+            <Text style={styles.authHint}>새로 사용할 비밀번호를 입력해주세요. (6자 이상)</Text>
+            <TextInput
+              style={styles.authInput}
+              placeholder="새 비밀번호"
+              value={newPassword}
+              onChangeText={setNewPassword}
+              secureTextEntry
+              autoCapitalize="none"
+            />
+            <TextInput
+              style={styles.authInput}
+              placeholder="새 비밀번호 확인"
+              value={newPasswordConfirm}
+              onChangeText={setNewPasswordConfirm}
+              secureTextEntry
+              autoCapitalize="none"
+            />
+
+            {authError ? <Text style={styles.authErrorText}>{authError}</Text> : null}
+
+            <TouchableOpacity
+              onPress={handleUpdatePassword}
+              disabled={passwordUpdating}
+              style={[styles.authButton, passwordUpdating && styles.authButtonDisabled]}
+            >
+              <Text style={styles.authButtonText}>
+                {passwordUpdating ? '변경 중...' : '비밀번호 변경'}
+              </Text>
+            </TouchableOpacity>
+          </>
+        )}
       </View>
     );
   }
@@ -1505,6 +1649,23 @@ const styles = StyleSheet.create({
     color: '#3B82F6',
     fontSize: 14,
     marginTop: 16,
+  },
+  authButtonDisabled: {
+    backgroundColor: '#93C5FD',
+  },
+  authWarnBox: {
+    backgroundColor: '#FEE2E2',
+    padding: 16,
+    borderRadius: 10,
+    marginBottom: 20,
+    width: '100%',
+    maxWidth: 360,
+  },
+  authWarnText: {
+    color: '#991B1B',
+    fontSize: 14,
+    textAlign: 'center',
+    lineHeight: 20,
   },
   authSuccessBox: {
     backgroundColor: '#D1FAE5',

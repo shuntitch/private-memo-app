@@ -22,11 +22,31 @@ const storage = Platform.OS === 'web'
     }
   : AsyncStorage;
 
+// 비밀번호 재설정 메일의 링크로 들어오면 URL에 토큰(#type=recovery...) 또는
+// 인증 코드(?code=...)가 실려온다. createClient가 이를 소비하면서 URL을 지워버리기
+// 때문에, 클라이언트를 만들기 전에 먼저 읽어둔다.
+const readAuthParamsFromUrl = () => {
+  if (Platform.OS !== 'web' || typeof window === 'undefined') return {};
+
+  const hash = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const query = new URLSearchParams(window.location.search);
+  const get = (key) => hash.get(key) || query.get(key);
+
+  return {
+    isRecovery: get('type') === 'recovery' || !!query.get('code'),
+    errorCode: get('error_code'),
+    errorDescription: get('error_description'),
+  };
+};
+
+export const initialAuthUrlParams = readAuthParamsFromUrl();
+
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
     storage: storage,
     autoRefreshToken: true,
     persistSession: true,
-    detectSessionInUrl: false,
+    // 웹에서는 재설정 링크의 토큰을 세션으로 교환해야 하므로 켜둔다
+    detectSessionInUrl: Platform.OS === 'web',
   },
 });
