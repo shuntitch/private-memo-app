@@ -17,7 +17,8 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import { supabase, initialAuthUrlParams } from './supabaseClient';
 import { RichEditor, RichViewer, preloadRichText } from './components/LazyRichText';
-import { resolveMemoDoc, countTasks } from './richText';
+import { resolveMemoDoc, countTasks, collectLinks } from './richText';
+import { LinkPreviews } from './components/LinkPreviews';
 
 // 사용 가능한 색상들
 const COLORS = [
@@ -1348,6 +1349,7 @@ export default function App() {
     const memoCats = (memo.categoryIds || [])
       .map((cid) => categories.find((c) => c.id === cid))
       .filter(Boolean);
+    const viewDoc = resolveMemoDoc(memo);
 
     return (
       <View style={{ flex: 1, backgroundColor: '#FFFFFF', paddingTop: Platform.OS === 'ios' ? 44 : 0 }}>
@@ -1385,9 +1387,11 @@ export default function App() {
 
           <RichViewer
             key={`${memo.id}-${viewerVersion}`}
-            doc={resolveMemoDoc(memo)}
+            doc={viewDoc}
             onToggleTask={({ json, text }) => updateMemoContent(memo.id, json, text)}
           />
+
+          <LinkPreviews urls={collectLinks(viewDoc)} />
 
           {memo.images && memo.images.length > 0 && (
             <View style={styles.viewImages}>

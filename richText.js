@@ -71,7 +71,10 @@ export const textToDoc = (text) => ({
 // 본문에 그냥 적혀 있는 http(s) 주소를 링크로 바꾼다.
 // 자동 링크는 입력 중 띄어쓰기를 해야 걸리므로, 기존 메모나 맨 끝에 붙여넣은 주소는 링크가 아닐 수 있다.
 // 글자 자체는 바꾸지 않으므로 docToText 결과는 그대로다.
-const URL_PATTERN = /https?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/g;
+// 도메인 부분은 ASCII만 인정해 `naver.com에서` 같은 조사를 떼어내고,
+// 경로(/, ?, # 뒤)에서는 `/wiki/대한민국` 같은 한글 주소를 인정한다.
+const URL_PATTERN =
+  /https?:\/\/[A-Za-z0-9\-._~:@%]+(?:[/?#][A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%ㄱ-ㆎ가-힣]*)?/g;
 const TRAILING_PUNCTUATION = /[.,!?;:'")\]]+$/;
 
 const linkifyText = (node) => {
@@ -110,6 +113,21 @@ export const resolveMemoDoc = (memo) => {
       ? memo.contentRich
       : textToDoc(memo ? memo.content : '');
   return linkifyDoc(doc);
+};
+
+// 본문에 걸린 http(s) 링크 주소 (중복 제거, 등장 순서 유지). 링크 미리보기용.
+export const collectLinks = (doc) => {
+  const seen = new Set();
+  const walk = (nodes) =>
+    (nodes || []).forEach((node) => {
+      (node.marks || []).forEach((mark) => {
+        const href = mark.type === 'link' && mark.attrs && mark.attrs.href;
+        if (href && /^https?:\/\//i.test(href)) seen.add(href);
+      });
+      walk(node.content);
+    });
+  walk(doc && doc.content);
+  return [...seen];
 };
 
 // 체크리스트 진행 현황 (목록 카드 표시용)
