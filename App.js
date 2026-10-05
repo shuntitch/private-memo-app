@@ -16,6 +16,8 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import { supabase, initialAuthUrlParams } from './supabaseClient';
+import { RichEditor, RichViewer, preloadRichText } from './components/LazyRichText';
+import { resolveMemoDoc, countTasks } from './richText';
 
 // 사용 가능한 색상들
 const COLORS = [
@@ -141,7 +143,9 @@ export default function App() {
 
   // 메모 입력 상태
   const [title, setTitle] = useState('');
-  const [content, setContent] = useState('');
+  const [content, setContent] = useState(''); // 일반 텍스트 (검색·목록 미리보기용)
+  const [contentRich, setContentRich] = useState(null); // 서식 포함 본문 (TipTap JSON)
+  const [viewerVersion, setViewerVersion] = useState(0); // 보기 화면 강제 재렌더용
   const [memoCategories, setMemoCategories] = useState([]);
   const [memoPinned, setMemoPinned] = useState(false);
   const [memoImages, setMemoImages] = useState([]);
@@ -189,10 +193,14 @@ export default function App() {
     return () => subscription.unsubscribe();
   }, []);
 
-  // 로그인 후 데이터 로드 + 마이그레이션 체크
+  // 로그인 후 데이터 로드 + 마이그레이션 체크.
+  // session 객체가 아니라 사용자 ID를 기준으로 한다. Supabase는 탭이 다시 보일 때마다
+  // (아이폰에서 다른 앱에 갔다 오면) 새 session 객체로 SIGNED_IN을 다시 보내는데,
+  // 그때마다 전체를 다시 불러오면 로딩 화면이 뜨면서 편집 중이던 화면과 커서가 초기화된다.
+  const userId = session ? session.user.id : null;
   useEffect(() => {
     // 재설정 중에는 데이터/마이그레이션 로드를 미룬다
-    if (session && !recoveryMode) {
+    if (userId && !recoveryMode) {
       loadData().then(() => {
         if (Platform.OS === 'web' && typeof localStorage !== 'undefined') {
           const localMemos = localStorage.getItem('memos');
@@ -203,11 +211,16 @@ export default function App() {
         }
       });
     }
-  }, [session, recoveryMode]);
+  }, [userId, recoveryMode]);
+
+  // 로그인하면 서식 편집기 코드를 미리 받아둔다 (메모를 처음 열 때 대기 없도록)
+  useEffect(() => {
+    if (userId) preloadRichText().catch(() => {});
+  }, [userId]);
 
   // ─── 화면에 필요한 이미지의 서명 URL 발급 ───
   useEffect(() => {
-    if (!session) return;
+    if (!userId) return;
 
     const needed = new Set();
     const collect = (value) => {
@@ -248,14 +261,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [session, memos, memoImages, signedUrls]);
+  }, [userId, memos, memoImages, signedUrls]);
 
   // 서명 URL 만료 전에 캐시를 비워 재발급을 유도
   useEffect(() => {
-    if (!session) return;
+    if (!userId) return;
     const timer = setInterval(() => setSignedUrls({}), SIGNED_URL_REFRESH_MS);
     return () => clearInterval(timer);
-  }, [session]);
+  }, [userId]);
 
   // ─── 인증 함수 ───
   const handleLogin = async () => {
@@ -411,6 +424,7 @@ export default function App() {
         id: row.id,
         title: row.title,
         content: row.content,
+        contentRich: row.content_rich || null,
         categoryIds: row.category_ids || [],
         pinned: row.pinned || false,
         images: row.images || [],
@@ -548,22 +562,28 @@ export default function App() {
   };
 
   // ─── 메모 저장 (Supabase) ───
-  const saveMemos = async (newMemos) => {
+  // 바뀐 메모 한 건만 저장하고, 서버 저장이 성공한 뒤에 화면 상태를 바꾼다
+  const persistMemo = async (memo) => {
     try {
-      setMemos(newMemos);
-      const rows = newMemos.map((m) => ({
-        id: m.id,
-        user_id: session.user.id,
-        title: m.title,
-        content: m.content,
-        category_ids: m.categoryIds,
-        pinned: m.pinned,
-        images: m.images,
-        created_at: m.createdAt,
-        updated_at: m.updatedAt,
-      }));
-      const { error } = await supabase.from('memos').upsert(rows, { onConflict: 'id' });
+      const { error } = await supabase.from('memos').upsert(
+        {
+          id: memo.id,
+          user_id: session.user.id,
+          title: memo.title,
+          content: memo.content,
+          content_rich: memo.contentRich,
+          category_ids: memo.categoryIds,
+          pinned: memo.pinned,
+          images: memo.images,
+          created_at: memo.createdAt,
+          updated_at: memo.updatedAt,
+        },
+        { onConflict: 'id' }
+      );
       if (error) throw error;
+      setMemos((prev) =>
+        prev.some((m) => m.id === memo.id) ? prev.map((m) => (m.id === memo.id ? memo : m)) : [memo, ...prev]
+      );
       return true;
     } catch (error) {
       console.error('메모 저장 실패:', error);
@@ -571,6 +591,28 @@ export default function App() {
       if (Platform.OS === 'web') window.alert(msg);
       else Alert.alert('오류', msg);
       return false;
+    }
+  };
+
+  // 보기 화면에서 체크리스트를 체크했을 때 본문만 갱신
+  const updateMemoContent = async (id, json, text) => {
+    const previous = memos.find((m) => m.id === id);
+    if (!previous) return;
+    const updatedAt = new Date().toISOString();
+    setMemos((prev) => prev.map((m) => (m.id === id ? { ...m, content: text, contentRich: json, updatedAt } : m)));
+
+    const { error } = await supabase
+      .from('memos')
+      .update({ content: text, content_rich: json, updated_at: updatedAt })
+      .eq('id', id);
+    if (error) {
+      console.error('체크 상태 저장 실패:', error);
+      // 화면을 저장 전 상태로 되돌린다 (보기 화면도 다시 그려서 체크 표시를 원복)
+      setMemos((prev) => prev.map((m) => (m.id === id ? previous : m)));
+      setViewerVersion((v) => v + 1);
+      const msg = '체크 상태를 저장하지 못했습니다.';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('오류', msg);
     }
   };
 
@@ -694,16 +736,24 @@ export default function App() {
     setCurrentMemo(null);
     setTitle('');
     setContent('');
+    setContentRich(null);
     setMemoCategories([]);
     setMemoPinned(false);
     setMemoImages([]);
     setCurrentView('edit');
   };
 
+  // 목록에서 메모를 누르면 먼저 보기 화면으로 연다
+  const openMemo = (memo) => {
+    setCurrentMemo(memo);
+    setCurrentView('view');
+  };
+
   const editMemo = (memo) => {
     setCurrentMemo(memo);
     setTitle(memo.title);
-    setContent(memo.content);
+    setContent(memo.content || '');
+    setContentRich(resolveMemoDoc(memo));
     setMemoCategories(memo.categoryIds || []);
     setMemoPinned(!!memo.pinned);
     setMemoImages(memo.images || []);
@@ -712,44 +762,28 @@ export default function App() {
 
   const saveMemo = async () => {
     if (!title.trim() && !content.trim()) {
-      Alert.alert('알림', '제목이나 내용을 입력하세요.');
+      const msg = '제목이나 내용을 입력하세요.';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('알림', msg);
       return;
     }
 
     const now = new Date().toISOString();
-    let success = false;
+    const base = currentMemo ? memos.find((m) => m.id === currentMemo.id) || currentMemo : null;
+    const memo = {
+      ...(base || { id: Date.now().toString(), createdAt: now }),
+      title: title.trim() || '제목 없음',
+      content,
+      contentRich,
+      categoryIds: memoCategories,
+      pinned: memoPinned,
+      images: memoImages,
+      updatedAt: now,
+    };
 
-    if (currentMemo) {
-      const updated = memos.map((m) =>
-        m.id === currentMemo.id
-          ? {
-              ...m,
-              title: title.trim() || '제목 없음',
-              content,
-              categoryIds: memoCategories,
-              pinned: memoPinned,
-              images: memoImages,
-              updatedAt: now,
-            }
-          : m
-      );
-      success = await saveMemos(updated);
-    } else {
-      const newMemo = {
-        id: Date.now().toString(),
-        title: title.trim() || '제목 없음',
-        content,
-        categoryIds: memoCategories,
-        pinned: memoPinned,
-        images: memoImages,
-        createdAt: now,
-        updatedAt: now,
-      };
-      success = await saveMemos([newMemo, ...memos]);
-    }
-
-    if (success) {
-      setCurrentView('list');
+    if (await persistMemo(memo)) {
+      setCurrentMemo(memo);
+      setCurrentView('view');
     }
   };
 
@@ -782,6 +816,10 @@ export default function App() {
       const { error } = await supabase.from('memos').delete().eq('id', id);
       if (error) throw error;
       setMemos((prev) => prev.filter((m) => m.id !== id));
+      if (currentMemo && currentMemo.id === id) {
+        setCurrentMemo(null);
+        setCurrentView('list');
+      }
     } catch (error) {
       console.error('메모 삭제 실패:', error);
       const msg = '메모 삭제 중 오류 발생';
@@ -935,6 +973,58 @@ export default function App() {
       month: 'long',
       day: 'numeric',
     });
+  };
+
+  // 이미지 확대 보기 (목록·보기·편집 화면 공용)
+  const renderImageModal = () => (
+    <Modal visible={showImageModal} transparent animationType="fade">
+      <View style={styles.imageModalOverlay}>
+        <TouchableOpacity style={styles.imageModalCloseButton} onPress={() => setShowImageModal(false)}>
+          <Text style={styles.imageModalCloseText}>✕</Text>
+        </TouchableOpacity>
+
+        {selectedImage && selectedImage.length > 0 && (
+          <>
+            <Image
+              source={{ uri: imageUri(selectedImage[selectedImageIndex]) }}
+              style={styles.imageModalImage}
+              resizeMode="contain"
+            />
+            <View style={styles.imageModalCounter}>
+              <Text style={styles.imageModalCounterText}>
+                {selectedImageIndex + 1} / {selectedImage.length}
+              </Text>
+            </View>
+            {selectedImage.length > 1 && (
+              <>
+                {selectedImageIndex > 0 && (
+                  <TouchableOpacity
+                    style={[styles.imageModalNavButton, styles.imageModalPrevButton]}
+                    onPress={() => setSelectedImageIndex((prev) => prev - 1)}
+                  >
+                    <Text style={styles.imageModalNavText}>‹</Text>
+                  </TouchableOpacity>
+                )}
+                {selectedImageIndex < selectedImage.length - 1 && (
+                  <TouchableOpacity
+                    style={[styles.imageModalNavButton, styles.imageModalNextButton]}
+                    onPress={() => setSelectedImageIndex((prev) => prev + 1)}
+                  >
+                    <Text style={styles.imageModalNavText}>›</Text>
+                  </TouchableOpacity>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </View>
+    </Modal>
+  );
+
+  const openImageViewer = (images, index) => {
+    setSelectedImage(images);
+    setSelectedImageIndex(index);
+    setShowImageModal(true);
   };
 
   // ═══════════════════════════════════════════
@@ -1251,6 +1341,70 @@ export default function App() {
     );
   }
 
+  // ─── 메모 보기 화면 ───
+  if (currentView === 'view' && currentMemo) {
+    // 체크·고정 등으로 바뀐 최신 상태를 쓰기 위해 목록에서 다시 찾는다
+    const memo = memos.find((m) => m.id === currentMemo.id) || currentMemo;
+    const memoCats = (memo.categoryIds || [])
+      .map((cid) => categories.find((c) => c.id === cid))
+      .filter(Boolean);
+
+    return (
+      <View style={{ flex: 1, backgroundColor: '#FFFFFF', paddingTop: Platform.OS === 'ios' ? 44 : 0 }}>
+        <StatusBar barStyle="dark-content" />
+        <View style={styles.header}>
+          <TouchableOpacity onPress={() => setCurrentView('list')}>
+            <Text style={styles.headerButton}>← 목록</Text>
+          </TouchableOpacity>
+          <View style={styles.headerActions}>
+            <TouchableOpacity onPress={() => togglePinMemo(memo.id)} style={styles.iconButton}>
+              <Text style={[styles.viewHeaderIcon, !memo.pinned && styles.viewHeaderIconOff]}>📌</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => deleteMemo(memo.id)} style={styles.iconButton}>
+              <Text style={styles.viewHeaderIcon}>🗑️</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={() => editMemo(memo)} style={styles.viewEditButton}>
+              <Text style={styles.viewEditButtonText}>편집</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <ScrollView style={styles.content} contentContainerStyle={styles.viewBody}>
+          <Text style={styles.viewTitle}>{memo.title}</Text>
+
+          <View style={styles.viewMetaRow}>
+            {memoCats.map((cat) => (
+              <View key={cat.id} style={[styles.memoCategoryTag, { backgroundColor: cat.color.color }]}>
+                <Text style={styles.memoCategoryText}>{cat.name}</Text>
+              </View>
+            ))}
+            <Text style={styles.memoDate}>{formatDate(memo.updatedAt)}</Text>
+          </View>
+
+          <View style={styles.viewDivider} />
+
+          <RichViewer
+            key={`${memo.id}-${viewerVersion}`}
+            doc={resolveMemoDoc(memo)}
+            onToggleTask={({ json, text }) => updateMemoContent(memo.id, json, text)}
+          />
+
+          {memo.images && memo.images.length > 0 && (
+            <View style={styles.viewImages}>
+              {memo.images.map((img, idx) => (
+                <TouchableOpacity key={idx} onPress={() => openImageViewer(memo.images, idx)}>
+                  <Image source={{ uri: imageUri(img) }} style={styles.viewImage} />
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
+        </ScrollView>
+
+        {renderImageModal()}
+      </View>
+    );
+  }
+
   // ─── 메모 작성/수정 화면 ───
   if (currentView === 'edit') {
     return (
@@ -1262,7 +1416,7 @@ export default function App() {
         >
           <StatusBar barStyle="dark-content" />
           <View style={styles.header}>
-            <TouchableOpacity onPress={() => setCurrentView('list')}>
+            <TouchableOpacity onPress={() => setCurrentView(currentMemo ? 'view' : 'list')}>
               <Text style={styles.headerButton}>← 취소</Text>
             </TouchableOpacity>
             <TouchableOpacity onPress={saveMemo}>
@@ -1326,14 +1480,17 @@ export default function App() {
               <View style={styles.divider} />
             </View>
 
-            <TextInput
-              style={styles.contentInput}
-              placeholder="여기에 메모를 작성하세요..."
-              value={content}
-              onChangeText={setContent}
-              multiline
-              placeholderTextColor="#9CA3AF"
-            />
+            <View style={styles.editorWrap}>
+              <RichEditor
+                key={currentMemo ? currentMemo.id : 'new'}
+                initialDoc={contentRich}
+                placeholder="여기에 메모를 작성하세요..."
+                onChange={({ json, text }) => {
+                  setContentRich(json);
+                  setContent(text);
+                }}
+              />
+            </View>
 
             <View style={styles.imageSection}>
               <View style={styles.imageSectionHeader}>
@@ -1369,48 +1526,7 @@ export default function App() {
             </View>
           </View>
 
-          <Modal visible={showImageModal} transparent animationType="fade">
-            <View style={styles.imageModalOverlay}>
-              <TouchableOpacity style={styles.imageModalCloseButton} onPress={() => setShowImageModal(false)}>
-                <Text style={styles.imageModalCloseText}>✕</Text>
-              </TouchableOpacity>
-
-              {selectedImage && selectedImage.length > 0 && (
-                <>
-                  <Image
-                    source={{ uri: imageUri(selectedImage[selectedImageIndex]) }}
-                    style={styles.imageModalImage}
-                    resizeMode="contain"
-                  />
-                  <View style={styles.imageModalCounter}>
-                    <Text style={styles.imageModalCounterText}>
-                      {selectedImageIndex + 1} / {selectedImage.length}
-                    </Text>
-                  </View>
-                  {selectedImage.length > 1 && (
-                    <>
-                      {selectedImageIndex > 0 && (
-                        <TouchableOpacity
-                          style={[styles.imageModalNavButton, styles.imageModalPrevButton]}
-                          onPress={() => setSelectedImageIndex((prev) => prev - 1)}
-                        >
-                          <Text style={styles.imageModalNavText}>‹</Text>
-                        </TouchableOpacity>
-                      )}
-                      {selectedImageIndex < selectedImage.length - 1 && (
-                        <TouchableOpacity
-                          style={[styles.imageModalNavButton, styles.imageModalNextButton]}
-                          onPress={() => setSelectedImageIndex((prev) => prev + 1)}
-                        >
-                          <Text style={styles.imageModalNavText}>›</Text>
-                        </TouchableOpacity>
-                      )}
-                    </>
-                  )}
-                </>
-              )}
-            </View>
-          </Modal>
+          {renderImageModal()}
         </KeyboardAvoidingView>
       </View>
     );
@@ -1522,11 +1638,12 @@ export default function App() {
                 .filter(Boolean);
               const firstCategory = memoCats[0];
               const cardBgColor = firstCategory ? firstCategory.color.light : '#FFFFFF';
+              const tasks = memo.contentRich ? countTasks(resolveMemoDoc(memo)) : { total: 0, done: 0 };
 
               return (
                 <TouchableOpacity
                   key={memo.id}
-                  onPress={() => editMemo(memo)}
+                  onPress={() => openMemo(memo)}
                   style={[styles.memoCard, { backgroundColor: cardBgColor }]}
                 >
                   <View style={styles.memoHeader}>
@@ -1547,11 +1664,11 @@ export default function App() {
                     </View>
                   </View>
 
-                  {memo.content && (
+                  {memo.content ? (
                     <Text style={styles.memoContent} numberOfLines={2}>
                       {memo.content}
                     </Text>
-                  )}
+                  ) : null}
 
                   {memo.images && memo.images.length > 0 && (
                     <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.memoImageList}>
@@ -1590,7 +1707,14 @@ export default function App() {
                         </View>
                       ))}
                     </View>
-                    <Text style={styles.memoDate}>{formatDate(memo.updatedAt)}</Text>
+                    <View style={styles.memoFooterRight}>
+                      {tasks.total > 0 ? (
+                        <Text style={[styles.memoTaskCount, tasks.done === tasks.total && styles.memoTaskCountDone]}>
+                          ☑ {tasks.done}/{tasks.total}
+                        </Text>
+                      ) : null}
+                      <Text style={styles.memoDate}>{formatDate(memo.updatedAt)}</Text>
+                    </View>
                   </View>
                 </TouchableOpacity>
               );
@@ -1598,48 +1722,7 @@ export default function App() {
           )}
         </ScrollView>
 
-        <Modal visible={showImageModal} transparent animationType="fade">
-          <View style={styles.imageModalOverlay}>
-            <TouchableOpacity style={styles.imageModalCloseButton} onPress={() => setShowImageModal(false)}>
-              <Text style={styles.imageModalCloseText}>✕</Text>
-            </TouchableOpacity>
-
-            {selectedImage && selectedImage.length > 0 && (
-              <>
-                <Image
-                  source={{ uri: imageUri(selectedImage[selectedImageIndex]) }}
-                  style={styles.imageModalImage}
-                  resizeMode="contain"
-                />
-                <View style={styles.imageModalCounter}>
-                  <Text style={styles.imageModalCounterText}>
-                    {selectedImageIndex + 1} / {selectedImage.length}
-                  </Text>
-                </View>
-                {selectedImage.length > 1 && (
-                  <>
-                    {selectedImageIndex > 0 && (
-                      <TouchableOpacity
-                        style={[styles.imageModalNavButton, styles.imageModalPrevButton]}
-                        onPress={() => setSelectedImageIndex((prev) => prev - 1)}
-                      >
-                        <Text style={styles.imageModalNavText}>‹</Text>
-                      </TouchableOpacity>
-                    )}
-                    {selectedImageIndex < selectedImage.length - 1 && (
-                      <TouchableOpacity
-                        style={[styles.imageModalNavButton, styles.imageModalNextButton]}
-                        onPress={() => setSelectedImageIndex((prev) => prev + 1)}
-                      >
-                        <Text style={styles.imageModalNavText}>›</Text>
-                      </TouchableOpacity>
-                    )}
-                  </>
-                )}
-              </>
-            )}
-          </View>
-        </Modal>
+        {renderImageModal()}
       </View>
     </View>
   );
@@ -1950,6 +2033,73 @@ const styles = StyleSheet.create({
     color: '#9CA3AF',
   },
 
+  memoFooterRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  memoTaskCount: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#4B5563',
+  },
+  memoTaskCountDone: {
+    color: '#10B981',
+  },
+
+  // 보기 화면
+  viewBody: {
+    padding: 20,
+    paddingBottom: 48,
+  },
+  viewTitle: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#1F2937',
+    marginBottom: 10,
+  },
+  viewMetaRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 6,
+  },
+  viewDivider: {
+    height: 1,
+    backgroundColor: '#E5E7EB',
+    marginVertical: 16,
+  },
+  viewImages: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 20,
+  },
+  viewImage: {
+    width: 100,
+    height: 100,
+    borderRadius: 8,
+    resizeMode: 'cover',
+  },
+  viewHeaderIcon: {
+    fontSize: 20,
+  },
+  viewHeaderIconOff: {
+    opacity: 0.35,
+  },
+  viewEditButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: '#3B82F6',
+    marginLeft: 4,
+  },
+  viewEditButtonText: {
+    color: '#FFFFFF',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+
   // 빈 상태
   emptyText: {
     textAlign: 'center',
@@ -2018,15 +2168,9 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     fontWeight: '600',
   },
-  contentInput: {
-    fontSize: 16,
-    color: '#1F2937',
-    lineHeight: 24,
+  editorWrap: {
     flex: 1,
-    minHeight: 300,
-    paddingHorizontal: 16,
-    paddingVertical: 16,
-    textAlignVertical: 'top',
+    minHeight: 240,
   },
   metaSection: {
     backgroundColor: '#F9FAFB',
